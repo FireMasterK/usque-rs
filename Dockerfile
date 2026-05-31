@@ -1,21 +1,36 @@
-FROM golang:1.25.5-alpine AS builder
+FROM rust:slim AS build
 
 WORKDIR /app
 
-COPY go.mod .
-COPY go.sum .
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    clang \
+    perl \
+    pkg-config \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN go mod download
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 
-COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release -p usque-cli --locked && \
+    cp target/release/usque /app/usque
 
-RUN go build -o usque -ldflags="-s -w" .
+FROM debian:stable-slim
 
-# scratch won't be enough, because we need a cert store
-FROM alpine:latest
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY --from=builder /app/usque /bin/usque
+COPY --from=build /app/usque /app/usque
 
-ENTRYPOINT ["/bin/usque"]
+ENTRYPOINT ["/app/usque"]
