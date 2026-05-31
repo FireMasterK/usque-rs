@@ -28,7 +28,10 @@ pub struct TlsOptions {
     pub alpn: Vec<Vec<u8>>,
 }
 
-pub fn build_rustls_config(signing_key: &SigningKey, options: TlsOptions) -> Result<Arc<ClientConfig>> {
+pub fn build_rustls_config(
+    signing_key: &SigningKey,
+    options: TlsOptions,
+) -> Result<Arc<ClientConfig>> {
     init();
     let (cert_der, key_der) = generate_self_signed_cert(signing_key)?;
     let cert_chain = vec![CertificateDer::from(cert_der)];
@@ -163,7 +166,7 @@ mod tests {
     #[test]
     fn init_and_build_config() {
         init();
-        let signing_key = SigningKey::random(&mut rand_core::OsRng);
+        let signing_key = SigningKey::generate();
         let peer_der = signing_key.verifying_key().to_public_key_der().unwrap();
         let peer_key = PublicKey::from_public_key_der(peer_der.as_bytes()).unwrap();
 
