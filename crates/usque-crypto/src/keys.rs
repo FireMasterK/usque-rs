@@ -1,13 +1,14 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use p256::ecdsa::SigningKey;
+use p256::elliptic_curve::Generate;
 use p256::PublicKey;
 use p256::SecretKey;
 use pem::parse;
 use pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
 
 pub fn generate_ec_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
-    let signing_key = SigningKey::random(&mut rand_core::OsRng);
+    let signing_key = SigningKey::generate();
     let private_der = signing_key
         .to_pkcs8_der()
         .context("failed to marshal private key")?
