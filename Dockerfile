@@ -8,6 +8,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     build-essential \
     cmake \
     clang \
+    git \
     perl \
     pkg-config \
     ca-certificates && \
