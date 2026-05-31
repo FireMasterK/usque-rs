@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use rand::RngCore;
+use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::Client;
 
@@ -81,13 +81,13 @@ fn prompt_yes_no(message: &str) -> Result<bool> {
 
 pub fn generate_random_wg_pubkey() -> Result<String> {
     let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     Ok(STANDARD.encode(key))
 }
 
 pub fn generate_random_android_serial() -> Result<String> {
     let mut serial = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut serial);
+    rand::rng().fill_bytes(&mut serial);
     Ok(hex::encode(serial))
 }
 
