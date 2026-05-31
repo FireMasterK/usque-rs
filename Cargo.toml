@@ -70,7 +70,7 @@ tokio-quiche = "0.19"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tun = { version = "0.7", features = ["async"] }
+tun = { version = "0.8", features = ["async"] }
 usque-cloudflare-api = { path = "crates/usque-cloudflare-api" }
 usque-config = { path = "crates/usque-config" }
 usque-crypto = { path = "crates/usque-crypto" }
