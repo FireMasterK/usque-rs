@@ -82,6 +82,7 @@ mod tests {
         let cli = Cli::parse_from_args([
             "usque",
             "socks",
+            "--auto-register",
             "-b",
             "127.0.0.1",
             "-p",
@@ -102,6 +103,7 @@ mod tests {
         .unwrap();
         match cli.command {
             crate::cmd::Commands::Socks(args) => {
+                assert!(args.auto_register);
                 assert_eq!(args.bind, "127.0.0.1");
                 assert_eq!(args.port, 1080);
                 assert_eq!(args.username.as_deref(), Some("user"));
@@ -120,6 +122,7 @@ mod tests {
         let cli = Cli::parse_from_args([
             "usque",
             "http-proxy",
+            "--auto-register",
             "-p",
             "8080",
             "-w",
@@ -128,6 +131,7 @@ mod tests {
         .unwrap();
         match cli.command {
             crate::cmd::Commands::HttpProxy(args) => {
+                assert!(args.auto_register);
                 assert_eq!(args.port, 8080);
                 assert_eq!(args.password.as_deref(), Some("secret"));
             }

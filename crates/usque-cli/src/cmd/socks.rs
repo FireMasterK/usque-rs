@@ -8,12 +8,16 @@ use clap::Args;
 use usque_proxy_socks::{run as run_socks, SocksProxyConfig};
 use usque_virtual_net::dns::DnsResolver;
 
+use crate::cmd::register::{auto_register_if_missing, RegisterOptions};
 use crate::runtime::{load_config, spawn_userspace_tunnel, TunnelFlags};
 
 #[derive(Debug, Args)]
 pub struct SocksArgs {
     #[command(flatten)]
     pub tunnel: TunnelFlags,
+    /// Register a new client when config is missing, then start the proxy
+    #[arg(long = "auto-register")]
+    pub auto_register: bool,
     #[arg(short = 'b', long, default_value = "0.0.0.0")]
     pub bind: String,
     #[arg(short = 'p', long, default_value = "1080")]
@@ -35,6 +39,11 @@ pub struct SocksArgs {
 }
 
 pub async fn run(args: SocksArgs, config_path: &str) -> Result<()> {
+    if args.auto_register {
+        auto_register_if_missing(RegisterOptions::auto_register_defaults(), config_path)
+        .await?;
+    }
+
     let config = load_config(config_path)?;
     let (stack, _device, _handle) = spawn_userspace_tunnel(&config, &args.tunnel, "socks")?;
 

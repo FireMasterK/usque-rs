@@ -3,12 +3,11 @@ use std::io::{self, Write};
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Args;
-
 use usque_config::{parse_endpoint_v4, parse_endpoint_v6, Config, DEFAULT_ENDPOINT_H2_V4};
 use usque_crypto::generate_ec_keypair;
 use usque_cloudflare_api::{self, CloudflareClient};
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 pub struct RegisterArgs {
     #[arg(short = 'l', long, default_value = usque_cloudflare_api::DEFAULT_LOCALE)]
     pub locale: String,
@@ -22,24 +21,57 @@ pub struct RegisterArgs {
     pub accept_tos: bool,
 }
 
-pub async fn run(args: RegisterArgs, config_path: &str) -> Result<()> {
-    if Config::load(config_path).is_ok() {
-        print!("You already have a config. Do you want to overwrite it? (y/n) ");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        if line.trim() != "y" {
-            return Ok(());
+#[derive(Debug, Clone)]
+pub struct RegisterOptions {
+    pub locale: String,
+    pub model: String,
+    pub name: Option<String>,
+    pub jwt: Option<String>,
+    pub accept_tos: bool,
+}
+
+impl From<RegisterArgs> for RegisterOptions {
+    fn from(args: RegisterArgs) -> Self {
+        Self {
+            locale: args.locale,
+            model: args.model,
+            name: args.name,
+            jwt: args.jwt,
+            accept_tos: args.accept_tos,
         }
     }
+}
 
+impl RegisterOptions {
+    /// Defaults for non-interactive `--auto-register` (TOS accepted, no JWT).
+    pub fn auto_register_defaults() -> Self {
+        Self {
+            locale: usque_cloudflare_api::DEFAULT_LOCALE.into(),
+            model: usque_cloudflare_api::DEFAULT_MODEL.into(),
+            name: None,
+            jwt: None,
+            accept_tos: true,
+        }
+    }
+}
+
+/// Register and write config when no config file exists yet.
+pub async fn auto_register_if_missing(opts: RegisterOptions, config_path: &str) -> Result<()> {
+    if Config::load(config_path).is_ok() {
+        return Ok(());
+    }
+    tracing::info!("No config found; registering a new client...");
+    perform_register(&opts, config_path).await
+}
+
+pub async fn perform_register(opts: &RegisterOptions, config_path: &str) -> Result<()> {
     let client = CloudflareClient::new();
     let account = usque_cloudflare_api::register(
         &client,
-        &args.model,
-        &args.locale,
-        args.jwt.as_deref(),
-        args.accept_tos,
+        &opts.model,
+        &opts.locale,
+        opts.jwt.as_deref(),
+        opts.accept_tos,
     )
     .await?;
 
@@ -51,7 +83,7 @@ pub async fn run(args: RegisterArgs, config_path: &str) -> Result<()> {
         &account.id,
         &token,
         &pub_key,
-        args.name.as_deref().unwrap_or(""),
+        opts.name.as_deref().unwrap_or(""),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -79,4 +111,18 @@ pub async fn run(args: RegisterArgs, config_path: &str) -> Result<()> {
     cfg.save(config_path)?;
     tracing::info!("Config saved to {config_path}");
     Ok(())
+}
+
+pub async fn run(args: RegisterArgs, config_path: &str) -> Result<()> {
+    if Config::load(config_path).is_ok() {
+        print!("You already have a config. Do you want to overwrite it? (y/n) ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        if line.trim() != "y" {
+            return Ok(());
+        }
+    }
+
+    perform_register(&args.into(), config_path).await
 }
