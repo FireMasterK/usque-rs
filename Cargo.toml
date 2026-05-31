@@ -81,4 +81,4 @@ usque-proxy-socks = { path = "crates/usque-proxy-socks" }
 usque-tun-platform = { path = "crates/usque-tun-platform" }
 usque-tunnel-core = { path = "crates/usque-tunnel-core" }
 usque-virtual-net = { path = "crates/usque-virtual-net" }
-x509-parser = "0.16"
+x509-parser = "0.18"
