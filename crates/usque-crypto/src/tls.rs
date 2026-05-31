@@ -158,7 +158,7 @@ impl ServerCertVerifier for PinnedKeyVerifier {
 
 #[cfg(test)]
 mod tests {
-    use p256::ecdsa::SigningKey;
+    use p256::{ecdsa::SigningKey, elliptic_curve::Generate};
     use pkcs8::EncodePublicKey;
 
     use super::*;
