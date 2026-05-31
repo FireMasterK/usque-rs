@@ -50,7 +50,7 @@ async fn configure_link(
     ipv6: Option<&str>,
 ) -> Result<()> {
     use futures::TryStreamExt;
-    use rtnetlink::new_connection;
+    use rtnetlink::{new_connection, LinkUnspec};
 
     let (connection, handle, _) = new_connection()?;
     tokio::spawn(connection);
@@ -65,9 +65,12 @@ async fn configure_link(
 
     handle
         .link()
-        .set(index)
-        .mtu(mtu as u32)
-        .up()
+        .change(
+            LinkUnspec::new_with_index(index)
+                .mtu(mtu as u32)
+                .up()
+                .build(),
+        )
         .execute()
         .await
         .context("failed to set link up/mtu")?;
