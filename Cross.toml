@@ -4,8 +4,7 @@
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
 pre-build = [
     "apt-get update",
-    "apt-get install --assume-yes --no-install-recommends wget gnupg ca-certificates perl",
-    "bash -c 'set -euo pipefail; if apt-get install --assume-yes --no-install-recommends clang-18 libclang-18-dev; then exit 0; fi; wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg; . /etc/os-release; echo \"deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-18 main\" > /etc/apt/sources.list.d/llvm.list; apt-get update; apt-get install --assume-yes --no-install-recommends clang-18 libclang-18-dev'",
+    "apt-get install --assume-yes --no-install-recommends perl clang-18 libclang-18-dev",
     "update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100",
     "update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100",
 ]
