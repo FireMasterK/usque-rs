@@ -1,0 +1,14 @@
+# boring-sys needs a modern libclang for bindgen and perl for the BoringSSL
+# build. The default cross image ships libclang 3.8, which is too old.
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update",
+    "apt-get install --assume-yes --no-install-recommends perl clang-10 libclang-10-dev llvm-10-dev",
+    "update-alternatives --install /usr/bin/clang clang /usr/bin/clang-10 100",
+    "update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-10 100",
+]
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = [
+    "LIBCLANG_PATH=/usr/lib/llvm-10/lib",
+]
