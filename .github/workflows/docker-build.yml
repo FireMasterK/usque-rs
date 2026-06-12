@@ -4,14 +4,29 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "*"
   pull_request:
   workflow_dispatch:
 
+env:
+  IMAGE_NAME: 1337kavin/usque-rs
+
 jobs:
-  docker-build:
+  build:
+    name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-gnu
+            platform: linux/arm64
 
     steps:
       - name: Checkout repository
@@ -19,26 +34,57 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang perl
+
+      - name: Build
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --release --locked -p usque-cli
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: usque-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/usque
+          if-no-files-found: error
+          retention-days: 7
+
+  docker:
+    name: Docker Build
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-gnu
+            platform: linux/arm64
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: usque-${{ matrix.target }}
+          path: dist
+
       - name: Set up Docker Buildx
-        id: setup-buildx
         uses: docker/setup-buildx-action@v4
-
-      - name: Cache BuildKit cache mounts
-        id: cache-mounts
-        uses: actions/cache@v5
-        with:
-          path: buildkit-cache
-          key: ${{ runner.os }}-buildkit-${{ hashFiles('Dockerfile') }}
-          restore-keys: |
-            ${{ runner.os }}-buildkit-
-
-      - name: Restore Docker cache mounts
-        uses: reproducible-containers/buildkit-cache-dance@v3
-        with:
-          builder: ${{ steps.setup-buildx.outputs.name }}
-          cache-dir: buildkit-cache
-          dockerfile: Dockerfile
-          skip-extraction: ${{ steps.cache-mounts.outputs.cache-hit }}
 
       - name: Log in to Docker Hub
         if: github.event_name != 'pull_request'
@@ -47,12 +93,83 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
-      - name: Build Docker image
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=long
+
+      - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.ci
+          platforms: ${{ matrix.platform }}
           push: ${{ github.event_name != 'pull_request' }}
-          tags: 1337kavin/usque-rs:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BINARY=dist/usque
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  manifest:
+    name: Docker Manifest
+    needs: docker
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create and push manifest lists
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGESTS: ${{ needs.docker.outputs.digest }}
+        run: |
+          set -euo pipefail
+          refs=()
+          for digest in $(echo "$DIGESTS" | tr ',' ' '); do
+            [ -n "${digest}" ] || continue
+            refs+=("${{ env.IMAGE_NAME }}@${digest}")
+          done
+          if [ ${#refs[@]} -eq 0 ]; then
+            echo "No per-arch digests found, skipping manifest creation."
+            exit 0
+          fi
+          for tag in $TAGS; do
+            echo "Creating manifest list for ${tag} (${#refs[@]} arches)"
+            docker buildx imagetools create \
+              --tag "${tag}" \
+              "${refs[@]}"
+          done
