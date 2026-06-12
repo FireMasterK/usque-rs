@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "*"
   pull_request:
   workflow_dispatch:
 
@@ -25,8 +23,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             platform: linux/amd64
+            arch_tag: amd64
           - target: aarch64-unknown-linux-gnu
             platform: linux/arm64
+            arch_tag: arm64
 
     steps:
       - name: Checkout repository
@@ -53,7 +53,7 @@ jobs:
           retention-days: 7
 
   docker:
-    name: Docker Build
+    name: Docker Build (${{ matrix.arch_tag }})
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -65,8 +65,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             platform: linux/amd64
+            arch_tag: amd64
           - target: aarch64-unknown-linux-gnu
             platform: linux/arm64
+            arch_tag: arm64
 
     outputs:
       digest: ${{ steps.build.outputs.digest }}
@@ -91,19 +93,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,format=long
-
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
@@ -112,8 +101,7 @@ jobs:
           file: Dockerfile.ci
           platforms: ${{ matrix.platform }}
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.IMAGE_NAME }}:latest-${{ matrix.arch_tag }}
           build-args: |
             BINARY=dist/usque
           cache-from: type=gha
@@ -137,22 +125,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Create and push manifest lists
+      - name: Create and push manifest list
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
           DIGESTS: ${{ needs.docker.outputs.digest }}
         run: |
           set -euo pipefail
@@ -161,13 +135,11 @@ jobs:
             [ -n "${digest}" ] || continue
             refs+=("${{ env.IMAGE_NAME }}@${digest}")
           done
-          if [ ${#refs[@]} -eq 0 ]; then
-            echo "No per-arch digests found, skipping manifest creation."
-            exit 0
+          if [ ${#refs[@]} -ne 2 ]; then
+            echo "Expected 2 arch digests, got ${#refs[@]}: ${DIGESTS}"
+            exit 1
           fi
-          for tag in $TAGS; do
-            echo "Creating manifest list for ${tag} (${#refs[@]} arches)"
-            docker buildx imagetools create \
-              --tag "${tag}" \
-              "${refs[@]}"
-          done
+          echo "Creating manifest list for ${{ env.IMAGE_NAME }}:latest (${#refs[@]} arches)"
+          docker buildx imagetools create \
+            --tag "${{ env.IMAGE_NAME }}:latest" \
+            "${refs[@]}"
