@@ -130,16 +130,13 @@ jobs:
           DIGESTS: ${{ needs.docker.outputs.digest }}
         run: |
           set -euo pipefail
-          refs=()
-          for digest in $(echo "$DIGESTS" | tr ',' ' '); do
-            [ -n "${digest}" ] || continue
-            refs+=("${{ env.IMAGE_NAME }}@${digest}")
-          done
-          if [ ${#refs[@]} -ne 2 ]; then
-            echo "Expected 2 arch digests, got ${#refs[@]}: ${DIGESTS}"
+          mapfile -t refs < <(echo "$DIGESTS" | jq -r 'to_entries[] | "\(.value)"')
+          if [ "${#refs[@]}" -ne 2 ]; then
+            echo "Expected 2 arch digests, got ${#refs[@]}: $DIGESTS"
             exit 1
           fi
-          echo "Creating manifest list for ${{ env.IMAGE_NAME }}:latest (${#refs[@]} arches)"
+          echo "Creating manifest list for ${IMAGE_NAME}:latest (${#refs[@]} arches)"
           docker buildx imagetools create \
-            --tag "${{ env.IMAGE_NAME }}:latest" \
-            "${refs[@]}"
+            --tag "${IMAGE_NAME}:latest" \
+            "${IMAGE_NAME}@${refs[0]}" \
+            "${IMAGE_NAME}@${refs[1]}"
