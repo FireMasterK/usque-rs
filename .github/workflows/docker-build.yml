@@ -128,5 +128,7 @@ jobs:
       - name: Create and push manifest list
         run: |
           set -euo pipefail
-          docker manifest create ${{ env.IMAGE_NAME }}:latest ${{ env.IMAGE_NAME }}:latest-arm64 ${{ env.IMAGE_NAME }}:latest-amd64
-          docker manifest push ${{ env.IMAGE_NAME }}:latest
+          docker buildx imagetools create \
+            --tag ${{ env.IMAGE_NAME }}:latest \
+            ${{ env.IMAGE_NAME }}:latest-arm64 \
+            ${{ env.IMAGE_NAME }}:latest-amd64
