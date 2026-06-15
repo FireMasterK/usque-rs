@@ -8,7 +8,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use usque_config::Config;
 use usque_crypto::{
     build_rustls_config, decode_endpoint_public_key, decode_private_key, init,
@@ -22,8 +21,7 @@ use usque_virtual_net::ChannelDevice;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("usque=info".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("usque=info".parse()?),
         )
         .init();
 
@@ -66,13 +64,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (device, to_device, _from_device) = ChannelDevice::pair();
-    let device = Arc::new(Mutex::new(device));
+    let device = Arc::new(device);
 
     // Wake the tunnel by sending a minimal outbound packet (ICMP echo stub).
     let wake = to_device.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let _ = wake.send(vec![0u8; 64]);
+        let _ = wake.send(bytes::Bytes::from(vec![0u8; 64]));
     });
 
     let maintain = MaintainTunnelConfig {

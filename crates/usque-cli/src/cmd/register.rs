@@ -3,9 +3,9 @@ use std::io::{self, Write};
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Args;
+use usque_cloudflare_api::{self, CloudflareClient};
 use usque_config::{parse_endpoint_v4, parse_endpoint_v6, Config, DEFAULT_ENDPOINT_H2_V4};
 use usque_crypto::generate_ec_keypair;
-use usque_cloudflare_api::{self, CloudflareClient};
 
 #[derive(Debug, Args, Clone)]
 pub struct RegisterArgs {

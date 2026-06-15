@@ -4214,6 +4214,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "futures",
  "rtnetlink",
  "thiserror 2.0.18",
@@ -4229,6 +4230,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "futures",
  "libc",
  "serde_json",
@@ -4249,6 +4251,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "etherparse",
  "futures",
  "libc",

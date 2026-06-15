@@ -38,15 +38,9 @@ pub async fn connect_h2(options: &crate::session::ConnectOptions) -> Result<Conn
         let _ = connection.await;
     });
 
-    let mut client = client
-        .ready()
-        .await
-        .context("HTTP/2 client not ready")?;
+    let mut client = client.ready().await.context("HTTP/2 client not ready")?;
 
-    let uri: Uri = options
-        .connect_uri
-        .parse()
-        .context("invalid connect URI")?;
+    let uri: Uri = options.connect_uri.parse().context("invalid connect URI")?;
 
     let request = Request::builder()
         .method(Method::CONNECT)
@@ -86,11 +80,20 @@ pub async fn connect_h2(options: &crate::session::ConnectOptions) -> Result<Conn
         loop {
             match recv_stream.data().await {
                 Some(Ok(data)) => {
-                    reader.push(&data);
+                    reader.push(data);
+                    let mut pushed = 0usize;
                     while let Some(packet) = reader.next_ip_packet() {
                         incoming.lock().await.push_back(packet);
+                        pushed += 1;
                     }
-                    notify.notify_waiters();
+                    if pushed > 0 {
+                        // Compaction runs occasionally to bound the
+                        // chunk chain length; O(1) per call.
+                        if reader.chunk_count() > 16 {
+                            reader.compact();
+                        }
+                        notify.notify_waiters();
+                    }
                 }
                 Some(Err(err)) => {
                     warn!("h2 read error: {err}");

@@ -228,7 +228,9 @@ async fn handle_http(
 
     let (parts, body) = upstream_res.into_parts();
     let body = body.collect().await?.to_bytes();
-    let mut response = Response::builder().status(parts.status).version(parts.version);
+    let mut response = Response::builder()
+        .status(parts.status)
+        .version(parts.version);
     for (name, value) in &parts.headers {
         response = response.header(name, value);
     }
@@ -238,7 +240,9 @@ async fn handle_http(
 
 fn origin_form_uri(uri: &Uri) -> Uri {
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    path_and_query.parse().unwrap_or_else(|_| Uri::from_static("/"))
+    path_and_query
+        .parse()
+        .unwrap_or_else(|_| Uri::from_static("/"))
 }
 
 fn authority_header_value(uri: &Uri) -> String {

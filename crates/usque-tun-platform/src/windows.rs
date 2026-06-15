@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 #[cfg(windows)]
 use async_trait::async_trait;
 #[cfg(windows)]
+use bytes::{Bytes, BytesMut};
+#[cfg(windows)]
 use std::process::Command;
 #[cfg(windows)]
 use std::sync::Arc;
@@ -17,17 +19,30 @@ use crate::{NativeTun, NativeTunConfig};
 use usque_tunnel_core::TunnelDevice;
 
 #[cfg(windows)]
-struct TunAsyncDevice(AsyncDevice);
+struct TunAsyncDevice(Arc<tokio::sync::Mutex<AsyncDevice>>);
 
 #[cfg(windows)]
 #[async_trait]
 impl TunnelDevice for TunAsyncDevice {
-    async fn read_packet(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf).await
+    async fn read_packet(&self, buf: &mut BytesMut) -> std::io::Result<usize> {
+        // Read into the spare capacity, then commit with `set_len`.
+        // See the Linux impl for the rationale.
+        let spare = buf.spare_capacity_mut();
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), spare.len()) };
+        let n = {
+            let mut dev = self.0.lock().await;
+            dev.read(dst).await?
+        };
+        unsafe {
+            buf.set_len(n);
+        }
+        Ok(n)
     }
 
-    async fn write_packet(&mut self, packet: &[u8]) -> std::io::Result<()> {
-        self.0.write_all(packet).await?;
+    async fn write_packet(&self, packet: Bytes) -> std::io::Result<()> {
+        let mut dev = self.0.lock().await;
+        dev.write_all(&packet).await?;
         Ok(())
     }
 }
@@ -61,7 +76,7 @@ pub async fn create(cfg: NativeTunConfig) -> Result<NativeTun> {
     }
 
     Ok(NativeTun {
-        device: Box::new(TunAsyncDevice(dev)),
+        device: Box::new(TunAsyncDevice(Arc::new(tokio::sync::Mutex::new(dev)))),
         name: iface_name,
     })
 }

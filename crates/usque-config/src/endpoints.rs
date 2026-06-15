@@ -27,10 +27,9 @@ pub fn select_endpoint(
                     "--http2 with --ipv6 requires config endpoint_h2_v6 to be set; see {HTTP2_WIKI_URL}"
                 );
             }
-            let ip: IpAddr = config
-                .endpoint_h2_v6
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid endpoint_h2_v6 value {:?}", config.endpoint_h2_v6))?;
+            let ip: IpAddr = config.endpoint_h2_v6.parse().map_err(|_| {
+                anyhow::anyhow!("invalid endpoint_h2_v6 value {:?}", config.endpoint_h2_v6)
+            })?;
             return Ok(match ip {
                 IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, port)),
                 IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, 0)),
@@ -103,7 +102,10 @@ mod endpoint_tests {
     fn select_http3_ipv4() {
         let cfg = sample_config();
         let addr = select_endpoint(&cfg, false, false, 443).unwrap();
-        assert_eq!(addr, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(162, 159, 198, 1), 443)));
+        assert_eq!(
+            addr,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(162, 159, 198, 1), 443))
+        );
     }
 
     #[test]
@@ -112,7 +114,12 @@ mod endpoint_tests {
         let addr = select_endpoint(&cfg, false, true, 443).unwrap();
         assert_eq!(
             addr,
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0x2606, 0x4700, 0x103, 0, 0, 0, 0, 0), 443, 0, 0))
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0x2606, 0x4700, 0x103, 0, 0, 0, 0, 0),
+                443,
+                0,
+                0
+            ))
         );
     }
 
@@ -120,7 +127,10 @@ mod endpoint_tests {
     fn select_http2_default_ipv4() {
         let cfg = sample_config();
         let addr = select_endpoint(&cfg, true, false, 443).unwrap();
-        assert_eq!(addr, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(162, 159, 198, 2), 443)));
+        assert_eq!(
+            addr,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(162, 159, 198, 2), 443))
+        );
     }
 
     #[test]

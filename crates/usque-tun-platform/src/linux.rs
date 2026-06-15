@@ -1,21 +1,44 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use std::io;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::{AbstractDevice, AsyncDevice, Configuration};
 
 use crate::{NativeTun, NativeTunConfig};
 use usque_tunnel_core::TunnelDevice;
 
-struct TunAsyncDevice(AsyncDevice);
+struct TunAsyncDevice(Arc<tokio::sync::Mutex<AsyncDevice>>);
 
 #[async_trait]
 impl TunnelDevice for TunAsyncDevice {
-    async fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf).await
+    async fn read_packet(&self, buf: &mut BytesMut) -> io::Result<usize> {
+        // `tun::AsyncDevice`'s `AsyncRead` impl expects a `&mut [u8]`
+        // slice. The supervisor's scratch `BytesMut` has `len == 0` and
+        // `cap == MTU`, so dereffing gives a zero-length slice. Read
+        // into the spare capacity instead, then commit with `set_len`.
+        let spare = buf.spare_capacity_mut();
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), spare.len()) };
+        // Lock the inner `AsyncDevice` only for the duration of the
+        // syscall, never across an `await` outside it. Holding the
+        // lock across the `read().await` would deadlock the supervisor
+        // (the other arm needs the same lock to write an inbound
+        // packet).
+        let n = {
+            let mut dev = self.0.lock().await;
+            dev.read(dst).await?
+        };
+        unsafe {
+            buf.set_len(n);
+        }
+        Ok(n)
     }
 
-    async fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
-        self.0.write_all(packet).await?;
+    async fn write_packet(&self, packet: Bytes) -> io::Result<()> {
+        let mut dev = self.0.lock().await;
+        dev.write_all(&packet).await?;
         Ok(())
     }
 }
@@ -38,7 +61,7 @@ pub async fn create(cfg: NativeTunConfig) -> Result<NativeTun> {
     }
 
     Ok(NativeTun {
-        device: Box::new(TunAsyncDevice(dev)),
+        device: Box::new(TunAsyncDevice(Arc::new(tokio::sync::Mutex::new(dev)))),
         name,
     })
 }
@@ -97,5 +120,3 @@ async fn configure_link(
 
     Ok(())
 }
-
-use std::io;

@@ -6,12 +6,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant as StdInstant};
 
+use bytes::{Bytes, BytesMut};
 use etherparse::{NetHeaders, PacketHeaders, PayloadSlice, TransportHeader};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, Medium};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -34,23 +37,48 @@ impl StackClock {
 }
 
 struct ChannelPhy {
-    rx: VecDeque<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    rx: VecDeque<Bytes>,
+    tx: mpsc::UnboundedSender<Bytes>,
     recent_syns: Arc<std::sync::Mutex<VecDeque<SynFingerprint>>>,
+    /// Reusable transmit scratch buffer. The smoltcp driver creates
+    /// a new `TxToken` for every transmit but only one is alive at a
+    /// time; this means the scratch buffer is safe to share. Holding
+    /// it in an `Arc<std::sync::Mutex<_>>` inside the `TxToken` lets
+    /// us *swap* it for a fresh `BytesMut` after each `consume()`
+    /// while still letting the device live inside the
+    /// `Send + Sync` `StackShared`.
+    ///
+    /// The scratch is recreated after every `consume()` rather than
+    /// reused: `BytesMut::split_to(len).freeze()` advances the
+    /// underlying `Arc<Vec<u8>>` pointer by `len` and `clear()` does
+    /// not move it back, so a long-lived scratch would shrink its
+    /// apparent capacity to zero after enough transmits (same class
+    /// of bug as `TunnelSupervisor::run_pumps`'s `to_tunnel`).
+    tx_scratch: Arc<std::sync::Mutex<BytesMut>>,
 }
 
 impl ChannelPhy {
-    fn new(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+    fn new(tx: mpsc::UnboundedSender<Bytes>) -> Self {
         Self {
             rx: VecDeque::new(),
             tx,
             recent_syns: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(16))),
+            tx_scratch: Arc::new(std::sync::Mutex::new(BytesMut::new())),
         }
     }
 
-    fn push_rx(&mut self, mut packet: Vec<u8>) {
-        self.normalize_inbound_rst_ack(&mut packet);
-        self.rx.push_back(packet);
+    fn push_rx(&mut self, packet: Bytes) {
+        // The RST-ACK normalization step needs an in-place mutation
+        // of the buffer. We can't get a `&mut [u8]` from a `Bytes`
+        // (the API is immutable), so we copy. The packet is small
+        // (≤ MTU bytes) and this is one allocation per inbound
+        // packet; the larger copy (DgramBuffer → Bytes) happens
+        // upstream in the H3 receiver and is unavoidable with
+        // datagram-socket 0.8. Future work: change the channel to
+        // carry `BytesMut` directly so the copy can be elided.
+        let mut owned = packet.to_vec();
+        self.normalize_inbound_rst_ack(&mut owned);
+        self.rx.push_back(Bytes::from(owned));
     }
 
     fn normalize_inbound_rst_ack(&self, packet: &mut [u8]) {
@@ -61,7 +89,16 @@ impl ChannelPhy {
             Some(TransportHeader::Tcp(header)) => header,
             _ => return,
         };
-        if !(tcp.rst && tcp.ack && !tcp.syn && !tcp.fin && !tcp.psh && !tcp.urg && !tcp.ece && !tcp.cwr && !tcp.ns) {
+        if !(tcp.rst
+            && tcp.ack
+            && !tcp.syn
+            && !tcp.fin
+            && !tcp.psh
+            && !tcp.urg
+            && !tcp.ece
+            && !tcp.cwr
+            && !tcp.ns)
+        {
             return;
         }
 
@@ -96,15 +133,11 @@ impl ChannelPhy {
 
         let ip_header_len = match &mut headers.net {
             Some(NetHeaders::Ipv4(ipv4, _)) => {
-                tcp.checksum = tcp
-                    .calc_checksum_ipv4(ipv4, payload)
-                    .unwrap_or_default();
+                tcp.checksum = tcp.calc_checksum_ipv4(ipv4, payload).unwrap_or_default();
                 ipv4.header_len()
             }
             Some(NetHeaders::Ipv6(ipv6, _)) => {
-                tcp.checksum = tcp
-                    .calc_checksum_ipv6(ipv6, payload)
-                    .unwrap_or_default();
+                tcp.checksum = tcp.calc_checksum_ipv6(ipv6, payload).unwrap_or_default();
                 ipv6.header_len()
             }
             Some(NetHeaders::Arp(_)) | None => return,
@@ -141,7 +174,7 @@ impl ChannelPhy {
 }
 
 struct RxToken {
-    buffer: Vec<u8>,
+    buffer: Bytes,
 }
 
 impl phy::RxToken for RxToken {
@@ -154,18 +187,71 @@ impl phy::RxToken for RxToken {
 }
 
 struct TxToken {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    scratch: Arc<std::sync::Mutex<BytesMut>>,
+    tx: mpsc::UnboundedSender<Bytes>,
     recent_syns: Arc<std::sync::Mutex<VecDeque<SynFingerprint>>>,
 }
+
+// SAFETY: smoltcp's driver creates at most one TxToken at a time and
+// drops it before the next `transmit()` call, so the scratch mutex
+// is only ever contended by the borrow inside `consume` itself.
+unsafe impl Send for TxToken {}
+unsafe impl Sync for TxToken {}
 
 impl phy::TxToken for TxToken {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0; len];
-        let result = f(&mut buffer);
-        if let Ok(headers) = PacketHeaders::from_ip_slice(&buffer) {
+        let result = {
+            let mut scratch = self.scratch.lock().expect("tx_scratch poisoned");
+            scratch.clear();
+            if scratch.capacity() < len {
+                scratch.reserve(len);
+            }
+            // `BytesMut::Deref` is `&[u8]` whose length is `len`, not
+            // `capacity`. To get a `&mut [u8]` of `len` bytes we have to
+            // use `spare_capacity_mut` (which exposes the tail of the
+            // allocation up to `capacity - len`) and then commit it with
+            // `set_len` after the closure returns.
+            let spare = scratch.spare_capacity_mut();
+            // Uninitialized memory is fine to expose to the closure
+            // because smoltcp's contract is "fill it with a packet of
+            // exactly `len` bytes".
+            let slice: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), len) };
+            let result = f(slice);
+            // Commit the bytes the closure wrote.
+            unsafe {
+                scratch.set_len(len);
+            }
+            result
+        };
+
+        // Detach the just-written prefix into a `Bytes` for the
+        // channel, then *swap the scratch* for a fresh one. We can't
+        // just `clear()` and reuse: `BytesMut::split_to(len).freeze()`
+        // advances the underlying `Arc<Vec<u8>>` pointer by `len`, so
+        // a long-lived scratch would shrink to zero capacity and
+        // smoltcp would start handing us zero-length transmit slices
+        // (same class of bug as the supervisor's `to_tunnel`).
+        //
+        // Sizing: the new scratch starts at `max(prev_cap, len)`, so
+        // the allocation grows monotonically to the largest packet
+        // we have ever seen and then stops. The old `BytesMut` (whose
+        // remaining tail capacity is `prev_cap - len` after the
+        // `split_to`) is dropped here; the underlying `Vec<u8>` is
+        // freed unless the frozen `Bytes` still holds a reference.
+        let (used, new_cap) = {
+            let mut scratch = self.scratch.lock().expect("tx_scratch poisoned");
+            let prev_cap = scratch.capacity();
+            let used = scratch.split_to(len).freeze();
+            (used, prev_cap.max(len))
+        };
+        *self.scratch.lock().expect("tx_scratch poisoned") = BytesMut::with_capacity(new_cap);
+
+        // Record SYN fingerprints for outbound SYNs.
+        if let Ok(headers) = PacketHeaders::from_ip_slice(&used) {
             if let (Some(net), Some(TransportHeader::Tcp(tcp))) = (headers.net, headers.transport) {
                 if tcp.syn && !tcp.ack && !tcp.rst {
                     let (src, dst) = match net {
@@ -193,7 +279,9 @@ impl phy::TxToken for TxToken {
                 }
             }
         }
-        let _ = self.tx.send(buffer);
+        // Truncate the `Bytes` to the actual amount the closure
+        // consumed; smoltcp may not have written all `len` bytes.
+        let _ = self.tx.send(used);
         result
     }
 }
@@ -217,6 +305,7 @@ impl Device for ChannelPhy {
             (
                 RxToken { buffer },
                 TxToken {
+                    scratch: Arc::clone(&self.tx_scratch),
                     tx: self.tx.clone(),
                     recent_syns: Arc::clone(&self.recent_syns),
                 },
@@ -226,6 +315,7 @@ impl Device for ChannelPhy {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(TxToken {
+            scratch: Arc::clone(&self.tx_scratch),
             tx: self.tx.clone(),
             recent_syns: Arc::clone(&self.recent_syns),
         })
@@ -307,7 +397,11 @@ impl AsyncRead for VirtualTcpStream {
 }
 
 impl AsyncWrite for VirtualTcpStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let mut inner = match this.shared.inner.try_lock() {
             Ok(inner) => inner,
@@ -375,19 +469,22 @@ impl VirtualUdpSocket {
                     }
                     Err(udp::SendError::BufferFull) => {}
                     Err(udp::SendError::Unaddressable) => {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "udp send failed"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "udp send failed",
+                        ));
                     }
                 }
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "udp send timed out"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "udp send timed out",
+                ));
             }
-            let _ = tokio::time::timeout(
-                Duration::from_millis(50),
-                self.shared.notify.notified(),
-            )
-            .await;
+            let _ = tokio::time::timeout(Duration::from_millis(50), self.shared.notify.notified())
+                .await;
         }
     }
 
@@ -415,13 +512,13 @@ impl VirtualUdpSocket {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "udp recv timed out"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "udp recv timed out",
+                ));
             }
-            let _ = tokio::time::timeout(
-                Duration::from_millis(50),
-                self.shared.notify.notified(),
-            )
-            .await;
+            let _ = tokio::time::timeout(Duration::from_millis(50), self.shared.notify.notified())
+                .await;
         }
     }
 }
@@ -444,8 +541,8 @@ impl VirtualStack {
         local_v4: Option<IpAddr>,
         local_v6: Option<IpAddr>,
         _mtu: usize,
-        from_tunnel: mpsc::UnboundedReceiver<Vec<u8>>,
-        to_tunnel: mpsc::UnboundedSender<Vec<u8>>,
+        from_tunnel: mpsc::UnboundedReceiver<Bytes>,
+        to_tunnel: mpsc::UnboundedSender<Bytes>,
         activity: Arc<Notify>,
     ) -> Self {
         let mut device = ChannelPhy::new(to_tunnel.clone());
@@ -507,8 +604,10 @@ impl VirtualStack {
 
         let handle = {
             let mut inner = self.shared.inner.lock().await;
-            let rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 65535]);
-            let tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 65535]);
+            let rx_buffer =
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 65535]);
+            let tx_buffer =
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 65535]);
             let mut socket = udp::Socket::new(rx_buffer, tx_buffer);
             let local_port = 49152 + rand::random::<u16>() % 16384;
             socket
@@ -537,11 +636,7 @@ impl VirtualStack {
             let remote_ip = IpAddress::from(addr.ip());
             let local_port = 49152 + rand::random::<u16>() % 16384;
             socket
-                .connect(
-                    inner.iface.context(),
-                    (remote_ip, addr.port()),
-                    local_port,
-                )
+                .connect(inner.iface.context(), (remote_ip, addr.port()), local_port)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tcp connect failed"))?;
             inner.sockets.add(socket)
         };
@@ -570,10 +665,14 @@ impl VirtualStack {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "tcp connect timed out"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tcp connect timed out",
+                ));
             }
 
-            let _ = tokio::time::timeout(Duration::from_millis(50), self.shared.notify.notified()).await;
+            let _ = tokio::time::timeout(Duration::from_millis(50), self.shared.notify.notified())
+                .await;
         }
     }
 
@@ -583,7 +682,7 @@ impl VirtualStack {
     }
 }
 
-async fn run_poll_loop(mut from_tunnel: mpsc::UnboundedReceiver<Vec<u8>>, shared: Arc<StackShared>) {
+async fn run_poll_loop(mut from_tunnel: mpsc::UnboundedReceiver<Bytes>, shared: Arc<StackShared>) {
     loop {
         tokio::select! {
             packet = from_tunnel.recv() => {

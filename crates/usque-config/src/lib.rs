@@ -9,8 +9,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const HTTP2_WIKI_URL: &str =
-    "https://github.com/Diniboy1123/usque/wiki/HTTP-2-support";
+pub const HTTP2_WIKI_URL: &str = "https://github.com/Diniboy1123/usque/wiki/HTTP-2-support";
 
 /// Application configuration compatible with the Go `config.json` format.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,9 +61,7 @@ struct PrettyFormatter {
 
 impl PrettyFormatter {
     fn new() -> Self {
-        Self {
-            current_indent: 0,
-        }
+        Self { current_indent: 0 }
     }
 }
 
@@ -117,10 +114,7 @@ impl serde_json::ser::Formatter for PrettyFormatter {
         Ok(())
     }
 
-    fn begin_string<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-    ) -> std::io::Result<()> {
+    fn begin_string<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
         writer.write_all(b"\"")?;
         Ok(())
     }
@@ -133,9 +127,7 @@ impl serde_json::ser::Formatter for PrettyFormatter {
 
 /// Strip Cloudflare endpoint suffixes like `:0` or `[...]:0` from API responses.
 pub fn parse_endpoint_v4(raw: &str) -> String {
-    raw.strip_suffix(":0")
-        .unwrap_or(raw)
-        .to_string()
+    raw.strip_suffix(":0").unwrap_or(raw).to_string()
 }
 
 pub fn parse_endpoint_v6(raw: &str) -> String {
@@ -150,10 +142,7 @@ mod tests {
     #[test]
     fn parse_endpoints() {
         assert_eq!(parse_endpoint_v4("162.159.198.1:0"), "162.159.198.1");
-        assert_eq!(
-            parse_endpoint_v6("[2606:4700:103::]:0"),
-            "2606:4700:103::"
-        );
+        assert_eq!(parse_endpoint_v6("[2606:4700:103::]:0"), "2606:4700:103::");
     }
 
     #[test]

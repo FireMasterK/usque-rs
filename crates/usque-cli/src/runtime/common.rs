@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use usque_config::Config;
 use usque_tunnel_core::{HookEnv, MaintainTunnelConfig, TunnelSupervisor};
 use usque_virtual_net::{ChannelDevice, VirtualStack};
@@ -47,11 +47,7 @@ pub fn load_config(path: &str) -> Result<Config> {
 }
 
 pub type UserspaceTunnelHandle = tokio::task::JoinHandle<()>;
-pub type UserspaceTunnelSpawn = (
-    Arc<VirtualStack>,
-    Arc<Mutex<ChannelDevice>>,
-    UserspaceTunnelHandle,
-);
+pub type UserspaceTunnelSpawn = (Arc<VirtualStack>, Arc<ChannelDevice>, UserspaceTunnelHandle);
 
 pub fn tunnel_addresses(cfg: &Config, flags: &TunnelFlags) -> (Option<IpAddr>, Option<IpAddr>) {
     let v4 = if flags.no_tunnel_ipv4 {
@@ -74,7 +70,7 @@ pub fn spawn_userspace_tunnel(
 ) -> Result<UserspaceTunnelSpawn> {
     let (v4, v6) = tunnel_addresses(config, flags);
     let (device, to_device, from_device) = ChannelDevice::pair();
-    let device = Arc::new(Mutex::new(device));
+    let device = Arc::new(device);
 
     let activity = Arc::new(Notify::new());
     let stack = Arc::new(VirtualStack::start(

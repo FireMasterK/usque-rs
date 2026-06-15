@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Args;
-use tokio::sync::Mutex;
 use usque_tun_platform::{NativeTun, NativeTunConfig};
 use usque_tunnel_core::{HookEnv, MaintainTunnelConfig, TunnelSupervisor};
 
@@ -62,7 +61,7 @@ pub async fn run(args: NativeTunArgs, config_path: &str) -> Result<()> {
         activity: None,
     };
 
-    let device = Arc::new(Mutex::new(tun));
+    let device = Arc::new(tun);
     TunnelSupervisor::maintain(maintain_cfg, device).await;
     Ok(())
 }

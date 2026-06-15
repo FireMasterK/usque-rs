@@ -40,8 +40,7 @@ pub struct SocksArgs {
 
 pub async fn run(args: SocksArgs, config_path: &str) -> Result<()> {
     if args.auto_register {
-        auto_register_if_missing(RegisterOptions::auto_register_defaults(), config_path)
-        .await?;
+        auto_register_if_missing(RegisterOptions::auto_register_defaults(), config_path).await?;
     }
 
     let config = load_config(config_path)?;

@@ -34,8 +34,8 @@ pub async fn run(cfg: SocksProxyConfig, stack: Arc<VirtualStack>) -> Result<()> 
         let udp_timeout = cfg.udp_timeout;
 
         tokio::spawn(async move {
-            if let Err(err) = serve_connection(socket, username, password, resolver, udp_timeout, stack)
-                .await
+            if let Err(err) =
+                serve_connection(socket, username, password, resolver, udp_timeout, stack).await
             {
                 tracing::debug!("socks connection failed: {err}");
             }
@@ -61,10 +61,12 @@ async fn serve_connection(
             .read_command()
             .await?
         }
-        _ => Socks5ServerProtocol::accept_no_auth(socket)
-            .await?
-            .read_command()
-            .await?,
+        _ => {
+            Socks5ServerProtocol::accept_no_auth(socket)
+                .await?
+                .read_command()
+                .await?
+        }
     };
 
     match cmd {
@@ -76,9 +78,9 @@ async fn serve_connection(
         }
         Socks5Command::UDPAssociate => {
             let udp = UdpSocket::bind("[::]:0").await?;
-            let bind = udp.local_addr().unwrap_or_else(|_| {
-                SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-            });
+            let bind = udp
+                .local_addr()
+                .unwrap_or_else(|_| SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), 0)));
             let client = proto.reply_success(bind).await?;
             let _ = relay_udp(client, udp, stack, udp_timeout).await;
         }

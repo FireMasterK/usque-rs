@@ -33,7 +33,8 @@ pub fn build_connect_options(config: &Config, flags: &TunnelFlags) -> Result<Con
 
     let quiche_credentials = Arc::new(prepare_quiche_client_credentials(&signing_key)?);
 
-    let endpoint = usque_config::select_endpoint(config, flags.http2, flags.ipv6, flags.connect_port)?;
+    let endpoint =
+        usque_config::select_endpoint(config, flags.http2, flags.ipv6, flags.connect_port)?;
 
     if flags.insecure {
         tracing::warn!("WARNING: --insecure is set, endpoint certificate pinning is disabled");

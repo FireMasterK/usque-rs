@@ -43,15 +43,7 @@ mod tests {
     #[test]
     fn parse_register_flags() {
         let cli = Cli::parse_from_args([
-            "usque",
-            "register",
-            "-a",
-            "-l",
-            "en_US",
-            "-m",
-            "PC",
-            "-n",
-            "dev",
+            "usque", "register", "-a", "-l", "en_US", "-m", "PC", "-n", "dev",
         ])
         .unwrap();
         match cli.command {
@@ -161,15 +153,8 @@ mod tests {
 
     #[test]
     fn parse_nativetun_flags() {
-        let cli = Cli::parse_from_args([
-            "usque",
-            "native-tun",
-            "-n",
-            "usque0",
-            "-I",
-            "--persist",
-        ])
-        .unwrap();
+        let cli = Cli::parse_from_args(["usque", "native-tun", "-n", "usque0", "-I", "--persist"])
+            .unwrap();
         match cli.command {
             crate::cmd::Commands::NativeTun(args) => {
                 assert_eq!(args.interface_name, "usque0");

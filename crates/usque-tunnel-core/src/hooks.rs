@@ -87,8 +87,14 @@ mod tests {
         let env = HookEnv::default()
             .with("USQUE_MODE", "socks")
             .with("USQUE_EVENT", "connect");
-        assert_eq!(env.values.get("USQUE_MODE").map(String::as_str), Some("socks"));
-        assert_eq!(env.values.get("USQUE_EVENT").map(String::as_str), Some("connect"));
+        assert_eq!(
+            env.values.get("USQUE_MODE").map(String::as_str),
+            Some("socks")
+        );
+        assert_eq!(
+            env.values.get("USQUE_EVENT").map(String::as_str),
+            Some("connect")
+        );
     }
 
     #[test]

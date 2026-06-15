@@ -97,13 +97,14 @@ async fn lookup_via_host(
 
     for server in servers {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket
-            .connect(SocketAddr::new(*server, 53))
-            .await?;
+        socket.connect(SocketAddr::new(*server, 53)).await?;
         let mut ips = Vec::new();
         for qtype in [28u16, 1u16] {
             let query = build_dns_query(host, qtype)?;
-            if tokio::time::timeout(timeout, socket.send(&query)).await.is_err() {
+            if tokio::time::timeout(timeout, socket.send(&query))
+                .await
+                .is_err()
+            {
                 continue;
             }
             let mut buf = [0u8; 512];

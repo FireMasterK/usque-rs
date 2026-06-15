@@ -6,9 +6,7 @@ use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::Client;
 
-use crate::models::{
-    AccountData, ApiErrorBody, DeviceUpdate, Registration,
-};
+use crate::models::{AccountData, ApiErrorBody, DeviceUpdate, Registration};
 use crate::{
     API_URL, API_VERSION, DEFAULT_LOCALE, DEFAULT_MODEL, KEY_TYPE_MASQUE, KEY_TYPE_WG,
     TUN_TYPE_MASQUE, TUN_TYPE_WG,
@@ -51,10 +49,7 @@ impl CloudflareClient {
     fn default_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static("WARP for Android"));
-        headers.insert(
-            "CF-Client-Version",
-            HeaderValue::from_static("a-6.35-4471"),
-        );
+        headers.insert("CF-Client-Version", HeaderValue::from_static("a-6.35-4471"));
         headers.insert(
             CONTENT_TYPE,
             HeaderValue::from_static("application/json; charset=UTF-8"),
@@ -98,7 +93,11 @@ pub async fn register(
     jwt: Option<&str>,
     accept_tos: bool,
 ) -> Result<AccountData> {
-    let model = if model.is_empty() { DEFAULT_MODEL } else { model };
+    let model = if model.is_empty() {
+        DEFAULT_MODEL
+    } else {
+        model
+    };
     let locale = if locale.is_empty() {
         DEFAULT_LOCALE
     } else {
@@ -137,7 +136,10 @@ pub async fn register(
         req = req.header("CF-Access-Jwt-Assertion", jwt);
     }
 
-    let resp = req.send().await.context("failed to send registration request")?;
+    let resp = req
+        .send()
+        .await
+        .context("failed to send registration request")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -187,19 +189,16 @@ pub async fn enroll_key(
         })?;
 
     let status = resp.status();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| ApiError {
-            body: ApiErrorBody {
-                success: false,
-                errors: vec![crate::models::ErrorInfo {
-                    code: 0,
-                    message: e.to_string(),
-                }],
-            },
-            status,
-        })?;
+    let body = resp.bytes().await.map_err(|e| ApiError {
+        body: ApiErrorBody {
+            success: false,
+            errors: vec![crate::models::ErrorInfo {
+                code: 0,
+                message: e.to_string(),
+            }],
+        },
+        status,
+    })?;
 
     if !status.is_success() {
         let api_err: ApiErrorBody = serde_json::from_slice(&body).map_err(|e| ApiError {

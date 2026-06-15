@@ -179,8 +179,14 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
                             break;
                         };
                         if let InboundFrame::Datagram(dgram) = frame {
+                            // dgram is an owned DgramBuffer (Vec<u8> wrapper).
+                            // datagram-socket 0.8 doesn't expose into_inner(),
+                            // so we copy into a Bytes here. The downstream
+                            // pipeline (CapsuleReader, supervisor) is now
+                            // zero-copy from this Bytes onward.
+                            let bytes = bytes::Bytes::copy_from_slice(dgram.as_slice());
                             if let Some(packet) =
-                                crate::datagram::decode_h3_datagram_payload(dgram.as_slice())
+                                crate::datagram::decode_h3_datagram_payload_owned(&bytes)
                             {
                                 incoming_recv.lock().await.push_back(packet);
                                 notify_recv.notify_waiters();
@@ -230,7 +236,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
         }
     });
 
-    Ok(ConnectIpSession::from_parts(
+    Ok(ConnectIpSession::with_capacity(
         incoming,
         notify,
         Transport::H3Quiche {
@@ -241,6 +247,9 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
             }),
         },
         closed,
+        // Reserve an MTU + datagram prefix so per-packet `write_packet`
+        // doesn't reallocate the scratch BytesMut.
+        1500,
     ))
 }
 
@@ -248,15 +257,8 @@ fn send_connect_request(
     controller: &mut ClientH3Controller,
     options: &crate::session::ConnectOptions,
 ) -> Result<()> {
-    let uri: Uri = options
-        .connect_uri
-        .parse()
-        .context("invalid connect URI")?;
-    let authority = uri
-        .authority()
-        .map(|a| a.as_str())
-        .unwrap_or("")
-        .as_bytes();
+    let uri: Uri = options.connect_uri.parse().context("invalid connect URI")?;
+    let authority = uri.authority().map(|a| a.as_str()).unwrap_or("").as_bytes();
     let path = uri.path().as_bytes();
 
     let headers = vec![
@@ -296,8 +298,15 @@ fn spawn_control_stream_reader(headers: IncomingH3Headers) {
         while let Some(frame) = recv.recv().await {
             match frame {
                 InboundFrame::Body(data, fin) => {
-                    reader.push(data.as_ref());
-                    let _ = reader.next_ip_packet();
+                    let bytes = data.freeze();
+                    reader.push(bytes);
+                    // Drain any complete packets; the control stream
+                    // carries address-assignment / route-advertisement
+                    // capsules that this client doesn't act on, so we
+                    // discard the parsed values.
+                    while let Some(_pkt) = reader.next_ip_packet() {
+                        // ignore
+                    }
                     if fin {
                         break;
                     }

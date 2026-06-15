@@ -6,6 +6,7 @@ mod windows;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use bytes::BytesMut;
 
 use usque_tunnel_core::TunnelDevice;
 
@@ -31,11 +32,11 @@ impl NativeTun {
 
 #[async_trait]
 impl TunnelDevice for NativeTun {
-    async fn read_packet(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    async fn read_packet(&self, buf: &mut BytesMut) -> std::io::Result<usize> {
         self.device.read_packet(buf).await
     }
 
-    async fn write_packet(&mut self, packet: &[u8]) -> std::io::Result<()> {
+    async fn write_packet(&self, packet: bytes::Bytes) -> std::io::Result<()> {
         self.device.write_packet(packet).await
     }
 }

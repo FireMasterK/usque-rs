@@ -9,8 +9,7 @@ pub fn generate_self_signed_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, V
         .to_pkcs8_der()
         .context("failed to marshal private key")?;
     let key_der = PrivatePkcs8KeyDer::from(key_der.as_bytes().to_vec());
-    let key_pair =
-        KeyPair::from_pkcs8_der_and_sign_algo(&key_der, &PKCS_ECDSA_P256_SHA256)
+    let key_pair = KeyPair::from_pkcs8_der_and_sign_algo(&key_der, &PKCS_ECDSA_P256_SHA256)
         .context("failed to build key pair")?;
 
     let mut params = CertificateParams::new(vec![]).context("failed to create cert params")?;

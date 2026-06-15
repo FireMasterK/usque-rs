@@ -10,6 +10,7 @@ use anyhow::Result;
 pub use session::{ConnectOptions, PacketSession, SessionError};
 
 pub use connect_ip::ConnectIpSession;
+pub use datagram::decrement_ttl;
 
 pub async fn connect_tunnel(options: &ConnectOptions) -> Result<Box<dyn PacketSession>> {
     if options.use_http2 {

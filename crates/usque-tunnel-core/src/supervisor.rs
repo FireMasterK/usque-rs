@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Notify};
+use bytes::{Bytes, BytesMut};
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::device::TunnelDevice;
@@ -71,7 +72,10 @@ fn log_ipv4_packet(direction: &str, packet: &[u8]) {
                 "tunnel: {direction} tcp {sport}->{dport} seq={seq} ack={ack} flags=0x{flags:02x}"
             );
             if direction == "out" && flags & 0x02 != 0 {
-                tracing::debug!("tunnel: out syn hex {:02x?}", &packet[..packet.len().min(52)]);
+                tracing::debug!(
+                    "tunnel: out syn hex {:02x?}",
+                    &packet[..packet.len().min(52)]
+                );
             }
         }
     }
@@ -80,12 +84,14 @@ fn log_ipv4_packet(direction: &str, packet: &[u8]) {
 pub struct TunnelSupervisor;
 
 impl TunnelSupervisor {
-    pub async fn maintain<D>(cfg: MaintainTunnelConfig, device: Arc<Mutex<D>>)
+    pub async fn maintain<D>(cfg: MaintainTunnelConfig, device: Arc<D>)
     where
         D: TunnelDevice + 'static,
     {
-        let mut wait_buf = vec![0u8; cfg.mtu];
-        let mut pending_outbound: Option<Vec<u8>> = None;
+        // Cold-path wait buffer; only used to detect outbound activity
+        // before the first connection. Reused per loop.
+        let mut wait_buf = BytesMut::with_capacity(cfg.mtu);
+        let mut pending_outbound: Option<Bytes> = None;
 
         loop {
             if !cfg.always_reconnect {
@@ -94,12 +100,13 @@ impl TunnelSupervisor {
                     info!("Tunnel idle. Waiting for outbound activity before reconnecting...");
                     tokio::select! {
                         read = async {
-                            let mut dev = device.lock().await;
-                            dev.read_packet(&mut wait_buf).await
+                            wait_buf.clear();
+                            device.read_packet(&mut wait_buf).await
                         } => match read {
-                            Ok(n) if is_valid_ip_packet(&wait_buf[..n]) => {
+                            Ok(n) if n > 0 && is_valid_ip_packet(&wait_buf[..n]) => {
                                 info!("Detected outbound activity ({n} bytes). Reconnecting...");
-                                pending_outbound = Some(wait_buf[..n].to_vec());
+                                let head = wait_buf.split_to(n);
+                                pending_outbound = Some(head.freeze());
                                 break;
                             }
                             Ok(_) => {}
@@ -135,7 +142,7 @@ impl TunnelSupervisor {
             info!("Connected to MASQUE server");
 
             if let Some(packet) = pending_outbound.take() {
-                if let Err(err) = session.write_packet(&packet).await {
+                if let Err(err) = session.write_packet(packet).await {
                     warn!("Failed to forward pending outbound packet: {err}");
                 }
             }
@@ -164,33 +171,70 @@ impl TunnelSupervisor {
 
     async fn run_pumps<D>(
         cfg: &MaintainTunnelConfig,
-        device: &Arc<Mutex<D>>,
+        device: &Arc<D>,
         session: &mut dyn PacketSession,
     ) -> SessionError
     where
         D: TunnelDevice + 'static,
     {
-        let mut to_tunnel = vec![0u8; cfg.mtu];
-        let mut from_tunnel = vec![0u8; cfg.mtu];
+        // Reusable scratch buffer for outbound packets. Recycled each
+        // iteration by replacing it with a fresh allocation — we
+        // can't reuse the same `BytesMut` because `split_to(n).freeze()`
+        // advances the underlying pointer by `n`, so after enough
+        // iterations the buffer's apparent capacity shrinks to zero
+        // and `read_packet` silently truncates every subsequent
+        // packet to 0 bytes (caught as a long-standing
+        // "first 3 SOCKS requests work, the rest time out" bug).
+        let mtu = cfg.mtu;
+        let mut to_tunnel = BytesMut::with_capacity(mtu);
+        let mut pkt_count: u64 = 0;
+        tracing::info!("run_pumps starting, mtu={mtu}");
 
         loop {
             tokio::select! {
                 read = async {
-                    let mut dev = device.lock().await;
-                    dev.read_packet(&mut to_tunnel).await
+                    to_tunnel.clear();
+                    device.read_packet(&mut to_tunnel).await
                 } => {
                     match read {
                         Ok(0) => continue,
-                Ok(n) => {
-                    if !is_valid_ip_packet(&to_tunnel[..n]) {
-                        continue;
-                    }
-                    tracing::debug!("tunnel: device -> masque ({n} bytes)");
-                    log_ipv4_packet("out", &to_tunnel[..n]);
-                    match session.write_packet(&to_tunnel[..n]).await {
+                        Ok(n) => {
+                            pkt_count += 1;
+                            tracing::debug!("pump#{}: read {} bytes from device", pkt_count, n);
+                            if !is_valid_ip_packet(&to_tunnel[..n]) {
+                                tracing::debug!("pump#{}: invalid IP packet", pkt_count);
+                                continue;
+                            }
+                            tracing::debug!("tunnel: device -> masque ({n} bytes)");
+                            log_ipv4_packet("out", &to_tunnel[..n]);
+                            // Decrement the IP TTL/hop-limit in place on
+                            // the reusable scratch. Doing it here (rather
+                            // than inside the session) keeps the session
+                            // API immutable with respect to the packet
+                            // body — the session encodes a fresh prefix
+                            // and `extend_from_slice`s the packet.
+                            if let Err(err) = usque_masque::decrement_ttl(&mut to_tunnel[..n]) {
+                                tracing::debug!("tunnel: skipping packet: {err}");
+                                continue;
+                            }
+                            // Detach the first `n` bytes from the scratch
+                            // and replace the scratch with a fresh
+                            // allocation. `BytesMut::split_to(n).freeze()`
+                            // is zero-copy for the resulting `Bytes`, but
+                            // it advances the scratch's underlying pointer
+                            // by `n`; reusing the scratch in subsequent
+                            // iterations would shrink its capacity to
+                            // zero after ~MTU/avg_pkt iterations. The
+                            // `to_tunnel` allocation is a single
+                            // amortised allocation per packet — cheap,
+                            // and far cheaper than the original silent
+                            // packet drops it was causing.
+                            let head = to_tunnel.split_to(n);
+                            let packet = head.freeze();
+                            to_tunnel = BytesMut::with_capacity(mtu);
+                            match session.write_packet(packet).await {
                                 Ok(Some(icmp)) => {
-                                    let mut dev = device.lock().await;
-                                    if let Err(err) = dev.write_packet(&icmp).await {
+                                    if let Err(err) = device.write_packet(icmp).await {
                                         return SessionError::Other(anyhow::anyhow!(
                                             "failed to write ICMP to device: {err}"
                                         ));
@@ -207,14 +251,13 @@ impl TunnelSupervisor {
                         }
                     }
                 }
-                session_read = session.read_packet(&mut from_tunnel) => {
+                session_read = session.read_packet() => {
                     match session_read {
-                        Ok(0) => continue,
-                        Ok(n) => {
-                            tracing::debug!("tunnel: masque -> device ({n} bytes)");
-                            log_ipv4_packet("in", &from_tunnel[..n]);
-                            let mut dev = device.lock().await;
-                            if let Err(err) = dev.write_packet(&from_tunnel[..n]).await {
+                        Ok(None) => continue,
+                        Ok(Some(packet)) => {
+                            tracing::debug!("tunnel: masque -> device ({} bytes)", packet.len());
+                            log_ipv4_packet("in", &packet);
+                            if let Err(err) = device.write_packet(packet).await {
                                 return SessionError::Other(anyhow::anyhow!(
                                     "failed to write to device: {err}"
                                 ));

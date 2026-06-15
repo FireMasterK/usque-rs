@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
+use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 use usque_tunnel_core::TunnelDevice;
 
@@ -11,45 +12,72 @@ pub use stack::{VirtualStack, VirtualTcpStream};
 
 /// Channel-backed packet device used by userspace modes.
 pub struct ChannelDevice {
-    inbound: mpsc::UnboundedReceiver<Vec<u8>>,
-    outbound: mpsc::UnboundedSender<Vec<u8>>,
+    inbound: tokio::sync::Mutex<mpsc::UnboundedReceiver<Bytes>>,
+    outbound: mpsc::UnboundedSender<Bytes>,
 }
 
 impl ChannelDevice {
     pub fn pair() -> (
         Self,
-        mpsc::UnboundedSender<Vec<u8>>,
-        mpsc::UnboundedReceiver<Vec<u8>>,
+        mpsc::UnboundedSender<Bytes>,
+        mpsc::UnboundedReceiver<Bytes>,
     ) {
-        let (to_device_tx, to_device_rx) = mpsc::unbounded_channel();
-        let (from_device_tx, from_device_rx) = mpsc::unbounded_channel();
+        let (to_tunnel_tx, to_tunnel_rx) = mpsc::unbounded_channel();
+        let (from_tunnel_tx, from_tunnel_rx) = mpsc::unbounded_channel();
         (
             Self {
-                inbound: to_device_rx,
-                outbound: from_device_tx,
+                inbound: tokio::sync::Mutex::new(to_tunnel_rx),
+                outbound: from_tunnel_tx,
             },
-            to_device_tx,
-            from_device_rx,
+            to_tunnel_tx,
+            from_tunnel_rx,
         )
     }
 }
 
 #[async_trait::async_trait]
 impl TunnelDevice for ChannelDevice {
-    async fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.inbound.recv().await {
-            Some(packet) => {
-                let n = packet.len().min(buf.len());
-                buf[..n].copy_from_slice(&packet[..n]);
-                Ok(n)
+    async fn read_packet(&self, buf: &mut BytesMut) -> io::Result<usize> {
+        // The receiver is wrapped in an async `Mutex` so the device
+        // trait can take `&self`. Locking is held only for the brief
+        // duration of `recv()`; the supervisor's other arm does not
+        // contend on this lock (it writes to the device, not reads),
+        // so the bidirectional `select!` cannot deadlock.
+        let packet = {
+            let mut rx = self.inbound.lock().await;
+            match rx.recv().await {
+                Some(p) => p,
+                None => return Err(io::ErrorKind::BrokenPipe.into()),
             }
-            None => Err(io::ErrorKind::BrokenPipe.into()),
+        };
+        // The supervisor hands us a scratch buffer whose `len` is 0 (it
+        // called `clear()` before the read). We must write into the
+        // buffer's spare capacity, not the zero-length logical prefix.
+        let spare = buf.spare_capacity_mut();
+        let n = packet.len().min(spare.len());
+        // SAFETY: `spare` exposes `buf.capacity() - buf.len()` bytes of
+        // allocated-but-uninitialized memory at the tail of the buffer.
+        // The caller (supervisor) reset `len` to 0 before calling, so
+        // `spare` covers the full allocation. We copy `n` bytes and
+        // commit with `set_len` below; the supervisor will `split_to(n)`
+        // to detach the written prefix.
+        let dst = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), n) };
+        dst.copy_from_slice(&packet[..n]);
+        unsafe {
+            buf.set_len(n);
         }
+        Ok(n)
     }
 
-    async fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+    async fn write_packet(&self, packet: Bytes) -> io::Result<()> {
+        // The supervisor hands us a `Bytes` it owns; we move it into
+        // the outbound queue without re-copying. This is the
+        // zero-copy inbound path: the supervisor's `Bytes` aliases
+        // the QUIC receive buffer (or the per-session scratch on the
+        // ICMP path), we move the refcount up by one, and the
+        // smoltcp poll task eventually hands it to the TxToken.
         self.outbound
-            .send(packet.to_vec())
+            .send(packet)
             .map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 }
@@ -60,20 +88,25 @@ pub type SharedVirtualStack = Arc<VirtualStack>;
 mod tests {
     use std::time::Duration;
 
+    use bytes::BytesMut;
     use tokio::sync::Notify;
 
     use super::*;
 
     #[tokio::test]
     async fn stack_keeps_tunnel_channel_open() {
-        let (mut device, to_tunnel, from_tunnel) = ChannelDevice::pair();
+        let (device, to_tunnel, from_tunnel) = ChannelDevice::pair();
         let activity = Arc::new(Notify::new());
         let _stack = VirtualStack::start(None, None, 1280, from_tunnel, to_tunnel, activity);
 
-        let read = tokio::spawn(async move { device.read_packet(&mut [0u8; 1280]).await });
+        let mut buf = BytesMut::with_capacity(1280);
+        let read = tokio::spawn(async move { device.read_packet(&mut buf).await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!read.is_finished(), "read should block while channel is open");
+        assert!(
+            !read.is_finished(),
+            "read should block while channel is open"
+        );
         read.abort();
     }
 }
