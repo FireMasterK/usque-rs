@@ -41,7 +41,7 @@ hyper = {version = "1", features = ["client", "http1", "http2", "server"]}
 hyper-util = {version = "0.1", features = ["tokio"]}
 libc = "0.2"
 p256 = {version = "0.14.0-rc.9", features = ["ecdsa", "pkcs8"]}
-pem = "3"
+pem = "4"
 pkcs8 = {version = "0.11.0", features = ["pem"]}
 rand = "0.10"
 rand_core = "0.10.1"
