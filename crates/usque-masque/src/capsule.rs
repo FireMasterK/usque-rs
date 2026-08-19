@@ -7,17 +7,35 @@ pub const CAPSULE_ADDRESS_REQUEST: u64 = 0x02;
 pub const CAPSULE_ROUTE_ADVERTISEMENT: u64 = 0x03;
 pub const CAPSULE_CONNECT_IP_REQUEST: u64 = 0x04;
 
-pub fn put_varint(out: &mut BytesMut, mut value: u64) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.put_u8(byte);
-        if value == 0 {
-            break;
-        }
+/// Encode a value as a QUIC variable-length integer (RFC 9000 §16).
+///
+/// HTTP datagram capsules (RFC 9297) frame their type and length fields with
+/// QUIC varints, where the two high bits of the first byte select a 1/2/4/8
+/// byte encoding. Values below 64 fit in one byte; larger values need more.
+/// Using a 7-bit continuation encoding here (as an earlier revision did)
+/// silently corrupts any capsule whose payload length is >= 64, because the
+/// peer then reads the length prefix as a multi-byte varint and the capsule
+/// stream desynchronizes.
+pub fn put_varint(out: &mut BytesMut, value: u64) {
+    if value < 64 {
+        out.put_u8(value as u8);
+    } else if value < 16_384 {
+        out.put_u8(0x40 | (value >> 8) as u8);
+        out.put_u8(value as u8);
+    } else if value < 1_073_741_824 {
+        out.put_u8(0x80 | (value >> 24) as u8);
+        out.put_u8((value >> 16) as u8);
+        out.put_u8((value >> 8) as u8);
+        out.put_u8(value as u8);
+    } else {
+        out.put_u8(0xC0 | (value >> 56) as u8);
+        out.put_u8((value >> 48) as u8);
+        out.put_u8((value >> 40) as u8);
+        out.put_u8((value >> 32) as u8);
+        out.put_u8((value >> 24) as u8);
+        out.put_u8((value >> 16) as u8);
+        out.put_u8((value >> 8) as u8);
+        out.put_u8(value as u8);
     }
 }
 
@@ -31,20 +49,22 @@ pub fn put_capsule(out: &mut BytesMut, capsule_type: u64, value: &[u8]) {
 /// supplied payload length. Useful for pre-reserving scratch buffers.
 pub const CAPSULE_OVERHEAD: usize = 3; // type varint (1) + length varint for 1500 (2)
 
+/// Decode a QUIC variable-length integer (RFC 9000 §16).
+///
+/// The two high bits of the first byte select the encoding length (1/2/4/8
+/// bytes). Returns the value and the number of bytes consumed, or `None` if
+/// the input is too short to hold the full varint.
 pub fn decode_varint(input: &[u8]) -> Option<(u64, usize)> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    for (i, &byte) in input.iter().enumerate() {
-        value |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some((value, i + 1));
-        }
-        shift += 7;
-        if shift > 63 {
-            return None;
-        }
+    let first = *input.first()?;
+    let len = 1usize << (first >> 6);
+    if input.len() < len {
+        return None;
     }
-    None
+    let mut value = (first & 0x3f) as u64;
+    for &byte in &input[1..len] {
+        value = (value << 8) | byte as u64;
+    }
+    Some((value, len))
 }
 
 /// Streaming reader for capsule-framed bodies. Stores pushed `Bytes`
@@ -262,20 +282,10 @@ impl Default for CapsuleReader {
 mod tests {
     use super::*;
 
-    fn encode_varint_vec(mut value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let mut byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-            if value == 0 {
-                break;
-            }
-        }
-        out
+    fn encode_varint_vec(value: u64) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        put_varint(&mut out, value);
+        out.to_vec()
     }
 
     fn encode_capsule_vec(capsule_type: u64, value: &[u8]) -> Vec<u8> {

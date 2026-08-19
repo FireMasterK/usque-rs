@@ -80,19 +80,16 @@ pub fn encode_h2_datagram_capsule_into(packet: &[u8], out: &mut BytesMut) -> any
 }
 
 fn decode_varint_local(data: &Bytes) -> Option<(u64, usize)> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        value |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some((value, i + 1));
-        }
-        shift += 7;
-        if shift > 63 {
-            return None;
-        }
+    let first = *data.first()?;
+    let len = 1usize << (first >> 6);
+    if data.len() < len {
+        return None;
     }
-    None
+    let mut value = (first & 0x3f) as u64;
+    for &byte in &data[1..len] {
+        value = (value << 8) | byte as u64;
+    }
+    Some((value, len))
 }
 
 #[cfg(test)]
