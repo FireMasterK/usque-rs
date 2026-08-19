@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::{Method, Request, Uri};
 use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
@@ -21,12 +22,31 @@ pub async fn connect_h2(options: &crate::session::ConnectOptions) -> Result<Conn
         .await
         .context("TCP dial failed")?;
 
+    connect_h2_on(options, tcp).await
+}
+
+/// Establish an HTTP/2 CONNECT-IP session over a caller-provided transport.
+///
+/// This is the transport-agnostic core of [`connect_h2`]: it performs the TLS
+/// handshake, the HTTP/2 handshake and the CONNECT-IP request over `stream`
+/// instead of dialing `options.endpoint` directly. Callers can therefore route
+/// the tunnel connection through any byte stream (e.g. another proxy's
+/// netstack) rather than the host network.
+pub async fn connect_h2_on<S>(
+    options: &crate::session::ConnectOptions,
+    stream: S,
+) -> Result<ConnectIpSession>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    init_crypto();
+
     let server_name = ServerName::try_from(options.sni.clone())
         .map_err(|_| anyhow::anyhow!("invalid SNI hostname"))?;
     let tls_config = Arc::clone(&options.tls_config);
     let connector = TlsConnector::from(tls_config);
     let tls = connector
-        .connect(server_name, tcp)
+        .connect(server_name, stream)
         .await
         .context("TLS handshake failed")?;
 
