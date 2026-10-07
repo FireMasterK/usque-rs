@@ -44,9 +44,11 @@ jobs:
           - arch_tag: amd64
             runner: ubuntu-latest
             asset: usque-linux-amd64
+            target: x86_64-unknown-linux-gnu
           - arch_tag: arm64
             runner: ubuntu-24.04-arm
             asset: usque-linux-arm64
+            target: aarch64-unknown-linux-gnu
 
     steps:
       - name: Checkout repository
@@ -65,10 +67,10 @@ jobs:
       - name: Build
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo build --release --locked -p usque-cli
+        run: cargo build --release --locked -p usque-cli --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/release/usque ${{ matrix.asset }}
+        run: cp target/${{ matrix.target }}/release/usque ${{ matrix.asset }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
