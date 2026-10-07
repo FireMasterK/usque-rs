@@ -12,8 +12,8 @@ env:
 
 jobs:
   build:
-    name: Build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.arch_tag }})
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
 
@@ -21,10 +21,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-latest
             platform: linux/amd64
             arch_tag: amd64
-          - target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
             platform: linux/arm64
             arch_tag: arm64
 
@@ -38,17 +38,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends cmake clang perl
 
       - name: Build
-        uses: houseabsolute/actions-rust-cross@v1
-        with:
-          command: build
-          target: ${{ matrix.target }}
-          args: --release --locked -p usque-cli
+        run: cargo build --release --locked -p usque-cli
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: usque-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/usque
+          name: usque-${{ matrix.arch_tag }}
+          path: target/release/usque
           if-no-files-found: error
           retention-days: 7
 
@@ -63,11 +59,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            platform: linux/amd64
+          - platform: linux/amd64
             arch_tag: amd64
-          - target: aarch64-unknown-linux-gnu
-            platform: linux/arm64
+          - platform: linux/arm64
             arch_tag: arm64
 
     outputs:
@@ -80,7 +74,7 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v8
         with:
-          name: usque-${{ matrix.target }}
+          name: usque-${{ matrix.arch_tag }}
           path: dist
 
       - name: Set up Docker Buildx

@@ -18,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - uses: wild-linker/action@latest
+      - uses: rui314/setup-mold@v1
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
