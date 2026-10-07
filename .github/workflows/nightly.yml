@@ -63,6 +63,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends cmake clang perl
 
       - name: Build
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release --locked -p usque-cli
 
       - name: Rename binary
