@@ -82,10 +82,8 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
         .await
         .context("failed to connect UDP socket")?;
 
-    let http3_settings = Http3Settings {
-        enable_extended_connect: true,
-        ..Default::default()
-    };
+    let mut http3_settings = Http3Settings::default();
+    http3_settings.enable_extended_connect = true;
     let (h3_driver, mut controller) = ClientH3Driver::new(http3_settings);
 
     let mut quic_settings = QuicSettings::default();
