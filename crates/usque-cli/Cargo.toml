@@ -16,6 +16,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
+crossfire.workspace = true
 humantime.workspace = true
 tokio.workspace = true
 tracing.workspace = true
