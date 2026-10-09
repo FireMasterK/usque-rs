@@ -2,7 +2,8 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::mpsc;
+use crossfire::{mpsc, AsyncRx, MTx};
+use tokio::sync::Mutex;
 use usque_tunnel_core::TunnelDevice;
 
 pub mod dns;
@@ -10,23 +11,29 @@ mod stack;
 
 pub use stack::{VirtualStack, VirtualTcpStream};
 
+/// Packet channel backing [`ChannelDevice`]: an unbounded crossfire
+/// MPSC with a *blocking* sender (the smoltcp `TxToken::consume` path
+/// is synchronous) and an async receiver (the device read path).
+///
+/// Mirrors the old `tokio::sync::mpsc::unbounded_channel` shape:
+/// `send()` is synchronous and never blocks for an unbounded channel.
+pub type PacketTx = MTx<mpsc::List<Bytes>>;
+/// Async-receiver half of the packet channel; see [`PacketTx`].
+pub type PacketRx = AsyncRx<mpsc::List<Bytes>>;
+
 /// Channel-backed packet device used by userspace modes.
 pub struct ChannelDevice {
-    inbound: tokio::sync::Mutex<mpsc::UnboundedReceiver<Bytes>>,
-    outbound: mpsc::UnboundedSender<Bytes>,
+    inbound: Mutex<PacketRx>,
+    outbound: PacketTx,
 }
 
 impl ChannelDevice {
-    pub fn pair() -> (
-        Self,
-        mpsc::UnboundedSender<Bytes>,
-        mpsc::UnboundedReceiver<Bytes>,
-    ) {
-        let (to_tunnel_tx, to_tunnel_rx) = mpsc::unbounded_channel();
-        let (from_tunnel_tx, from_tunnel_rx) = mpsc::unbounded_channel();
+    pub fn pair() -> (Self, PacketTx, PacketRx) {
+        let (to_tunnel_tx, to_tunnel_rx) = mpsc::unbounded_async::<Bytes>();
+        let (from_tunnel_tx, from_tunnel_rx) = mpsc::unbounded_async::<Bytes>();
         (
             Self {
-                inbound: tokio::sync::Mutex::new(to_tunnel_rx),
+                inbound: Mutex::new(to_tunnel_rx),
                 outbound: from_tunnel_tx,
             },
             to_tunnel_tx,
@@ -38,16 +45,19 @@ impl ChannelDevice {
 #[async_trait::async_trait]
 impl TunnelDevice for ChannelDevice {
     async fn read_packet(&self, buf: &mut BytesMut) -> io::Result<usize> {
-        // The receiver is wrapped in an async `Mutex` so the device
-        // trait can take `&self`. Locking is held only for the brief
-        // duration of `recv()`; the supervisor's other arm does not
-        // contend on this lock (it writes to the device, not reads),
-        // so the bidirectional `select!` cannot deadlock.
+        // `crossfire`'s single-consumer `AsyncRx` is `!Sync`, so it is
+        // wrapped in an async `Mutex` to make `ChannelDevice: Sync`
+        // while keeping the trait's `&self` API (`recv()` itself only
+        // borrows `&self`). Locking is held only for the duration of
+        // `recv()`; the supervisor's other arm does not contend on
+        // this lock (it writes to the device, not reads), so the
+        // bidirectional `select!` cannot deadlock.
         let packet = {
-            let mut rx = self.inbound.lock().await;
+            let rx = self.inbound.lock().await;
             match rx.recv().await {
-                Some(p) => p,
-                None => return Err(io::ErrorKind::BrokenPipe.into()),
+                Ok(p) => p,
+                // All senders dropped: the stack side is gone.
+                Err(_) => return Err(io::ErrorKind::BrokenPipe.into()),
             }
         };
         // The supervisor hands us a scratch buffer whose `len` is 0 (it

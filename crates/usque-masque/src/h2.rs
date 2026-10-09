@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use crossfire::mpsc;
 use http::{Method, Request, Uri};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
@@ -89,7 +89,7 @@ where
 
     debug!("HTTP/2 CONNECT-IP established: {}", response.status());
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(64);
+    let (out_tx, out_rx) = mpsc::bounded_async::<Bytes>(64);
     let session = ConnectIpSession::new(Transport::H2 { out: out_tx });
     let incoming = session.incoming_queue();
     let notify = session.notify();
@@ -104,7 +104,7 @@ where
                     reader.push(data);
                     let mut pushed = 0usize;
                     while let Some(packet) = reader.next_ip_packet() {
-                        incoming.lock().await.push_back(packet);
+                        incoming.lock().push_back(packet);
                         pushed += 1;
                     }
                     if pushed > 0 {
@@ -133,7 +133,7 @@ where
     });
 
     tokio::spawn(async move {
-        while let Some(data) = out_rx.recv().await {
+        while let Ok(data) = out_rx.recv().await {
             if send_stream.send_data(data, false).is_err() {
                 break;
             }

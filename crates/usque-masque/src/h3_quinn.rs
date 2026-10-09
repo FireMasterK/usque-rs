@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::{BufMut, Bytes};
+use crossfire::mpsc;
 use futures_util::future;
 use http::Uri;
-use tokio::sync::mpsc;
-use tokio::sync::{Mutex, Notify};
+use parking_lot::Mutex;
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use h3_datagram::datagram_handler::HandleDatagramsExt;
@@ -23,8 +24,8 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
         std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
     };
 
-    let mut endpoint = quinn::Endpoint::client((bind_ip, 0).into())
-        .context("failed to create QUIC endpoint")?;
+    let mut endpoint =
+        quinn::Endpoint::client((bind_ip, 0).into()).context("failed to create QUIC endpoint")?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(Arc::clone(&options.tls_config))
@@ -111,7 +112,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
     let header = header_buf.freeze();
     let header_out = header.clone();
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (out_tx, out_rx) = mpsc::bounded_async::<Vec<u8>>(64);
     let incoming = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let notify = Arc::new(Notify::new());
     let closed = Arc::new(AtomicBool::new(false));
@@ -160,7 +161,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
                     let bytes = dgram.into_payload();
                     if let Some(packet) = crate::datagram::decode_h3_datagram_payload_owned(&bytes)
                     {
-                        incoming_recv.lock().await.push_back(packet);
+                        incoming_recv.lock().push_back(packet);
                         notify_dgram.notify_waiters();
                     }
                 }
@@ -190,7 +191,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
             tokio::select! {
                 msg = out_rx.recv() => {
                     match msg {
-                        Some(payload) => {
+                        Ok(payload) => {
                             // `send_datagram_wait` blocks (applies backpressure)
                             // when the datagram send buffer is full instead of
                             // dropping oldest datagrams like `send_datagram` does.
@@ -212,7 +213,8 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
                                 }
                             }
                         }
-                        None => break,
+                        // All senders dropped (session torn down): exit the task.
+                        Err(_) => break,
                     }
                 }
                 _ = tick.tick() => {

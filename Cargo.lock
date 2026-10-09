@@ -598,6 +598,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "crossfire"
+version = "3.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb5e5c51e448ac2309883593482db91a5549c528d08a36aaa87bba13e5a40ae"
+dependencies = [
+ "crossbeam-utils",
+ "futures-core",
+ "parking_lot",
+ "pointers",
+ "smallvec",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2388,6 +2401,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "pointers"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5dcdc93847ad24990939cce6e1804361e903efcb5f99daa5abd87943a9d6d7ba"
+
+[[package]]
 name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4067,6 +4086,7 @@ dependencies = [
  "async-trait",
  "boring",
  "bytes",
+ "crossfire",
  "etherparse",
  "futures-util",
  "h2",
@@ -4075,6 +4095,7 @@ dependencies = [
  "h3-quinn",
  "http",
  "libc",
+ "parking_lot",
  "quinn",
  "rustls",
  "serde_json",
@@ -4170,9 +4191,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "crossfire",
  "etherparse",
  "futures",
  "libc",
+ "parking_lot",
  "rand 0.10.3",
  "serde_json",
  "smoltcp",

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use bytes::{Bytes, BytesMut};
 use etherparse::{NetHeaders, PacketHeaders, PayloadSlice, TransportHeader};
+use parking_lot::Mutex;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, Medium};
 use smoltcp::socket::{tcp, udp};
@@ -19,8 +20,10 @@ use smoltcp::wire::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::futures::OwnedNotified;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+use crate::{PacketRx, PacketTx};
 
 struct StackClock {
     start: StdInstant,
@@ -40,16 +43,16 @@ impl StackClock {
 
 struct ChannelPhy {
     rx: VecDeque<Bytes>,
-    tx: mpsc::UnboundedSender<Bytes>,
+    tx: PacketTx,
     /// MTU reported to smoltcp. Must match the tunnel MTU so the
     /// userspace stack never emits a frame the QUIC datagram path
     /// cannot carry.
     mtu: usize,
-    recent_syns: Arc<std::sync::Mutex<VecDeque<SynFingerprint>>>,
+    recent_syns: Arc<Mutex<VecDeque<SynFingerprint>>>,
     /// Reusable transmit scratch buffer. The smoltcp driver creates
     /// a new `TxToken` for every transmit but only one is alive at a
     /// time; this means the scratch buffer is safe to share. Holding
-    /// it in an `Arc<std::sync::Mutex<_>>` inside the `TxToken` lets
+    /// it in an `Arc<parking_lot::Mutex<_>>` inside the `TxToken` lets
     /// us *swap* it for a fresh `BytesMut` after each `consume()`
     /// while still letting the device live inside the
     /// `Send + Sync` `StackShared`.
@@ -60,17 +63,17 @@ struct ChannelPhy {
     /// not move it back, so a long-lived scratch would shrink its
     /// apparent capacity to zero after enough transmits (same class
     /// of bug as `TunnelSupervisor::run_pumps`'s `to_tunnel`).
-    tx_scratch: Arc<std::sync::Mutex<BytesMut>>,
+    tx_scratch: Arc<Mutex<BytesMut>>,
 }
 
 impl ChannelPhy {
-    fn new(tx: mpsc::UnboundedSender<Bytes>, mtu: usize) -> Self {
+    fn new(tx: PacketTx, mtu: usize) -> Self {
         Self {
             rx: VecDeque::new(),
             tx,
             mtu,
-            recent_syns: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(16))),
-            tx_scratch: Arc::new(std::sync::Mutex::new(BytesMut::new())),
+            recent_syns: Arc::new(Mutex::new(VecDeque::with_capacity(16))),
+            tx_scratch: Arc::new(Mutex::new(BytesMut::new())),
         }
     }
 
@@ -121,7 +124,7 @@ impl ChannelPhy {
             Some(NetHeaders::Arp(_)) | None => return,
         };
 
-        let mut recent_syns = self.recent_syns.lock().expect("recent_syns poisoned");
+        let mut recent_syns = self.recent_syns.lock();
         let Some((idx, _syn)) = recent_syns.iter().enumerate().find(|(_, syn)| {
             syn.src == local_ip
                 && syn.dst == remote_ip
@@ -194,9 +197,9 @@ impl phy::RxToken for RxToken {
 }
 
 struct TxToken {
-    scratch: Arc<std::sync::Mutex<BytesMut>>,
-    tx: mpsc::UnboundedSender<Bytes>,
-    recent_syns: Arc<std::sync::Mutex<VecDeque<SynFingerprint>>>,
+    scratch: Arc<Mutex<BytesMut>>,
+    tx: PacketTx,
+    recent_syns: Arc<Mutex<VecDeque<SynFingerprint>>>,
 }
 
 // SAFETY: smoltcp's driver creates at most one TxToken at a time and
@@ -211,7 +214,7 @@ impl phy::TxToken for TxToken {
         F: FnOnce(&mut [u8]) -> R,
     {
         let result = {
-            let mut scratch = self.scratch.lock().expect("tx_scratch poisoned");
+            let mut scratch = self.scratch.lock();
             scratch.clear();
             if scratch.capacity() < len {
                 scratch.reserve(len);
@@ -250,12 +253,12 @@ impl phy::TxToken for TxToken {
         // `split_to`) is dropped here; the underlying `Vec<u8>` is
         // freed unless the frozen `Bytes` still holds a reference.
         let (used, new_cap) = {
-            let mut scratch = self.scratch.lock().expect("tx_scratch poisoned");
+            let mut scratch = self.scratch.lock();
             let prev_cap = scratch.capacity();
             let used = scratch.split_to(len).freeze();
             (used, prev_cap.max(len))
         };
-        *self.scratch.lock().expect("tx_scratch poisoned") = BytesMut::with_capacity(new_cap);
+        *self.scratch.lock() = BytesMut::with_capacity(new_cap);
 
         // Record SYN fingerprints for outbound SYNs.
         if let Ok(headers) = PacketHeaders::from_ip_slice(&used) {
@@ -272,7 +275,7 @@ impl phy::TxToken for TxToken {
                         ),
                         NetHeaders::Arp(_) => return result,
                     };
-                    let mut recent_syns = self.recent_syns.lock().expect("recent_syns poisoned");
+                    let mut recent_syns = self.recent_syns.lock();
                     if recent_syns.len() >= 16 {
                         recent_syns.pop_front();
                     }
@@ -409,9 +412,9 @@ impl StackInner {
     /// socket set previously only ever grew: every proxied TCP
     /// connection and every DNS lookup leaked for the process
     /// lifetime.
-    fn drain_reap_queue(&mut self, incoming: &std::sync::Mutex<Vec<ReapRequest>>) {
+    fn drain_reap_queue(&mut self, incoming: &Mutex<Vec<ReapRequest>>) {
         {
-            let mut q = incoming.lock().expect("reap queue poisoned");
+            let mut q = incoming.lock();
             if !q.is_empty() {
                 self.pending_reaps.append(&mut q);
             }
@@ -446,9 +449,7 @@ impl StackInner {
                         } else {
                             // Progress the handshake (no-op if
                             // already closing) then wait a tick.
-                            self.sockets
-                                .get_mut::<tcp::Socket>(req.handle)
-                                .close();
+                            self.sockets.get_mut::<tcp::Socket>(req.handle).close();
                             self.pending_reaps[i].attempts += 1;
                             i += 1;
                         }
@@ -466,10 +467,11 @@ pub struct StackShared {
     /// take `Arc<Notify>` by value.
     notify: Arc<Notify>,
     /// Sockets to retire once their owner (`VirtualTcpStream` /
-    /// `VirtualUdpSocket`) is dropped. A sync mutex, because `Drop`
-    /// runs on the sync side and must not touch the async `inner`
-    /// lock; drained by the stack poll task under `inner`.
-    reap: std::sync::Mutex<Vec<ReapRequest>>,
+    /// `VirtualUdpSocket`) is dropped. A separate sync mutex (like
+    /// `inner`, its guard never crosses an `.await`, which the
+    /// `!Send` guard type enforces at compile time); drained by the
+    /// stack poll task under `inner`.
+    reap: Mutex<Vec<ReapRequest>>,
     clock: StackClock,
 }
 
@@ -500,8 +502,8 @@ impl AsyncRead for VirtualTcpStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let mut inner = match this.shared.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(_) => {
+            Some(inner) => inner,
+            None => {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -572,8 +574,8 @@ impl AsyncWrite for VirtualTcpStream {
         }
         let this = self.get_mut();
         let mut inner = match this.shared.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(_) => {
+            Some(inner) => inner,
+            None => {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -619,7 +621,7 @@ impl AsyncWrite for VirtualTcpStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if let Ok(mut inner) = this.shared.inner.try_lock() {
+        if let Some(mut inner) = this.shared.inner.try_lock() {
             inner.sockets.get_mut::<tcp::Socket>(this.handle).close();
             inner.poll(&this.shared.clock);
             // Wake anyone parked in `poll_read`/`poll_write` so a
@@ -642,15 +644,11 @@ impl Drop for VirtualTcpStream {
         // leaving it in the `SocketSet` forever. The poll task
         // finishes the FIN handshake before actually removing it
         // (or force-removes after ~6s).
-        self.shared
-            .reap
-            .lock()
-            .expect("reap queue poisoned")
-            .push(ReapRequest {
-                handle: self.handle,
-                kind: ReapKind::Tcp,
-                attempts: 0,
-            });
+        self.shared.reap.lock().push(ReapRequest {
+            handle: self.handle,
+            kind: ReapKind::Tcp,
+            attempts: 0,
+        });
         // Wake the poll task so the drain happens promptly even
         // without waiting for the 10ms tick to elapse naturally.
         self.shared.notify.notify_waiters();
@@ -659,15 +657,11 @@ impl Drop for VirtualTcpStream {
 
 impl Drop for VirtualUdpSocket {
     fn drop(&mut self) {
-        self.shared
-            .reap
-            .lock()
-            .expect("reap queue poisoned")
-            .push(ReapRequest {
-                handle: self.handle,
-                kind: ReapKind::Udp,
-                attempts: 0,
-            });
+        self.shared.reap.lock().push(ReapRequest {
+            handle: self.handle,
+            kind: ReapKind::Udp,
+            attempts: 0,
+        });
         self.shared.notify.notify_waiters();
     }
 }
@@ -682,7 +676,7 @@ impl VirtualUdpSocket {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             {
-                let mut inner = self.shared.inner.lock().await;
+                let mut inner = self.shared.inner.lock();
                 let socket = inner.sockets.get_mut::<udp::Socket>(self.handle);
                 match socket.send_slice(data, meta) {
                     Ok(()) => {
@@ -715,7 +709,7 @@ impl VirtualUdpSocket {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             {
-                let mut inner = self.shared.inner.lock().await;
+                let mut inner = self.shared.inner.lock();
                 let socket = inner.sockets.get_mut::<udp::Socket>(self.handle);
                 match socket.recv_slice(buf) {
                     Ok((n, meta)) => {
@@ -764,8 +758,8 @@ impl VirtualStack {
         local_v4: Option<IpAddr>,
         local_v6: Option<IpAddr>,
         mtu: usize,
-        from_tunnel: mpsc::UnboundedReceiver<Bytes>,
-        to_tunnel: mpsc::UnboundedSender<Bytes>,
+        from_tunnel: PacketRx,
+        to_tunnel: PacketTx,
         activity: Arc<Notify>,
     ) -> Self {
         let mut device = ChannelPhy::new(to_tunnel.clone(), mtu);
@@ -804,7 +798,7 @@ impl VirtualStack {
         let shared = Arc::new(StackShared {
             inner: Mutex::new(inner),
             notify: Arc::new(Notify::new()),
-            reap: std::sync::Mutex::new(Vec::new()),
+            reap: Mutex::new(Vec::new()),
             clock,
         });
 
@@ -828,7 +822,7 @@ impl VirtualStack {
         self.wake();
 
         let handle = {
-            let mut inner = self.shared.inner.lock().await;
+            let mut inner = self.shared.inner.lock();
             let rx_buffer =
                 udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 65535]);
             let tx_buffer =
@@ -854,7 +848,7 @@ impl VirtualStack {
         self.wake();
 
         let handle = {
-            let mut inner = self.shared.inner.lock().await;
+            let mut inner = self.shared.inner.lock();
             let rx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
             let tx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
             let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
@@ -869,7 +863,7 @@ impl VirtualStack {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
             {
-                let mut inner = self.shared.inner.lock().await;
+                let mut inner = self.shared.inner.lock();
                 inner.poll(&self.shared.clock);
                 let state = inner.sockets.get::<tcp::Socket>(handle).state();
                 match state {
@@ -886,15 +880,11 @@ impl VirtualStack {
                         // enqueue the reap here — otherwise a refused
                         // connection leaves its socket (and 128KB of
                         // buffer) in the set forever.
-                        self.shared
-                            .reap
-                            .lock()
-                            .expect("reap queue poisoned")
-                            .push(ReapRequest {
-                                handle,
-                                kind: ReapKind::Tcp,
-                                attempts: 0,
-                            });
+                        self.shared.reap.lock().push(ReapRequest {
+                            handle,
+                            kind: ReapKind::Tcp,
+                            attempts: 0,
+                        });
                         return Err(io::Error::new(
                             io::ErrorKind::ConnectionRefused,
                             "tcp connection closed",
@@ -905,15 +895,11 @@ impl VirtualStack {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                self.shared
-                    .reap
-                    .lock()
-                    .expect("reap queue poisoned")
-                    .push(ReapRequest {
-                        handle,
-                        kind: ReapKind::Tcp,
-                        attempts: 0,
-                    });
+                self.shared.reap.lock().push(ReapRequest {
+                    handle,
+                    kind: ReapKind::Tcp,
+                    attempts: 0,
+                });
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "tcp connect timed out",
@@ -931,19 +917,19 @@ impl VirtualStack {
     }
 }
 
-async fn run_poll_loop(mut from_tunnel: mpsc::UnboundedReceiver<Bytes>, shared: Arc<StackShared>) {
+async fn run_poll_loop(from_tunnel: PacketRx, shared: Arc<StackShared>) {
     loop {
         tokio::select! {
             packet = from_tunnel.recv() => {
-                let Some(packet) = packet else { break };
-                let mut inner = shared.inner.lock().await;
+                let Ok(packet) = packet else { break };
+                let mut inner = shared.inner.lock();
                 inner.device.push_rx(packet);
                 inner.poll(&shared.clock);
                 inner.drain_reap_queue(&shared.reap);
                 shared.notify.notify_waiters();
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                let mut inner = shared.inner.lock().await;
+                let mut inner = shared.inner.lock();
                 inner.poll(&shared.clock);
                 inner.drain_reap_queue(&shared.reap);
                 shared.notify.notify_waiters();

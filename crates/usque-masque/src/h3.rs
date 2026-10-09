@@ -6,9 +6,10 @@ use boring::ssl::{
     SslAlert, SslContextBuilder, SslFiletype, SslMethod, SslVerifyError, SslVerifyMode,
 };
 use bytes::Bytes;
+use crossfire::mpsc;
 use futures_util::SinkExt;
 use http::Uri;
-use tokio::sync::mpsc;
+use parking_lot::Mutex;
 use tokio_quiche::datagram_socket::DgramBuffer;
 use tokio_quiche::http3::driver::{
     ClientH3Event, H3Event, InboundFrame, IncomingH3Headers, NewClientRequest, OutboundFrame,
@@ -143,8 +144,8 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
 
     send_connect_request(&mut controller, options)?;
 
-    let (dgram_out_tx, mut dgram_out_rx) = mpsc::channel::<Vec<u8>>(64);
-    let incoming = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
+    let (dgram_out_tx, dgram_out_rx) = mpsc::bounded_async::<Vec<u8>>(64);
+    let incoming = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let notify = Arc::new(tokio::sync::Notify::new());
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -189,7 +190,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
                             if let Some(packet) =
                                 crate::datagram::decode_h3_datagram_payload_owned(&bytes)
                             {
-                                incoming_recv.lock().await.push_back(packet);
+                                incoming_recv.lock().push_back(packet);
                                 notify_recv.notify_waiters();
                             }
                         }
@@ -231,7 +232,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
     let fid = flow_id.ok_or_else(|| anyhow!("CONNECT-IP datagram flow ID missing"))?;
     tokio::spawn(async move {
         let mut send = send;
-        while let Some(payload) = dgram_out_rx.recv().await {
+        while let Ok(payload) = dgram_out_rx.recv().await {
             // The payload Vec already carries QUARTER_SID_HEADROOM zero
             // bytes up front (reserved by `write_packet`); wrapping it
             // moves the buffer instead of copying it, and the driver

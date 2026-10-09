@@ -19,6 +19,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 boring = {workspace = true, optional = true}
 bytes.workspace = true
+crossfire.workspace = true
 etherparse.workspace = true
 futures-util.workspace = true
 h2.workspace = true
@@ -27,6 +28,7 @@ h3-datagram = {workspace = true, optional = true}
 h3-quinn = {workspace = true, optional = true}
 http.workspace = true
 libc.workspace = true
+parking_lot.workspace = true
 quinn = {workspace = true, optional = true}
 rustls.workspace = true
 serde_json.workspace = true

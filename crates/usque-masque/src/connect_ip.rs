@@ -6,7 +6,9 @@ use async_trait::async_trait;
 #[cfg(feature = "quinn")]
 use bytes::BufMut;
 use bytes::{Bytes, BytesMut};
-use tokio::sync::{mpsc, Mutex, Notify};
+use crossfire::{mpsc, MAsyncTx};
+use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 #[cfg(feature = "quiche")]
 use tokio_quiche::ClientH3Controller;
@@ -33,7 +35,7 @@ pub(crate) enum Transport {
         /// Raw payload: context-id varint + IP packet (no quarter-stream-id
         /// prefix — tokio-quiche's driver prepends it into the buffer's
         /// headroom before handing the datagram to quiche).
-        out: mpsc::Sender<Vec<u8>>,
+        out: MAsyncTx<mpsc::Array<Vec<u8>>>,
         _guard: Arc<H3ConnectionGuard>,
     },
     #[cfg(feature = "quinn")]
@@ -43,10 +45,10 @@ pub(crate) enum Transport {
         header: Bytes,
         /// Raw payload: context-id varint + IP packet (no quarter-stream-id
         /// prefix — the sender task builds the final contiguous `Bytes`).
-        out: mpsc::Sender<Vec<u8>>,
+        out: MAsyncTx<mpsc::Array<Vec<u8>>>,
     },
     H2 {
-        out: mpsc::Sender<Bytes>,
+        out: MAsyncTx<mpsc::Array<Bytes>>,
     },
 }
 
@@ -123,7 +125,7 @@ fn encode_h3_quiche_payload(packet: &[u8], out: &mut Vec<u8>) -> anyhow::Result<
 impl PacketSession for ConnectIpSession {
     async fn read_packet(&mut self) -> Result<Option<Bytes>, SessionError> {
         loop {
-            if let Some(packet) = self.incoming.lock().await.pop_front() {
+            if let Some(packet) = self.incoming.lock().pop_front() {
                 return Ok(Some(packet));
             }
             if self.closed.load(Ordering::Relaxed) {
@@ -214,7 +216,7 @@ mod tests {
         // The H2 path uses `put_capsule` (1 type varint + 1 length
         // varint + payload). Verify the first 2 bytes encode the
         // CONNECT-IP DATA type and the packet length.
-        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let (tx, rx) = mpsc::bounded_async::<Bytes>(8);
         let mut session = ConnectIpSession::with_capacity(
             Arc::new(Mutex::new(VecDeque::new())),
             Arc::new(Notify::new()),
@@ -241,7 +243,7 @@ mod tests {
     async fn read_packet_returns_queued_bytes() {
         let incoming: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::new()));
         let notify = Arc::new(Notify::new());
-        let (tx, _rx) = mpsc::channel::<Bytes>(8);
+        let (tx, _rx) = mpsc::bounded_async::<Bytes>(8);
         let mut session = ConnectIpSession::with_capacity(
             Arc::clone(&incoming),
             Arc::clone(&notify),
@@ -251,7 +253,7 @@ mod tests {
         );
 
         let expected = sample_packet();
-        incoming.lock().await.push_back(expected.clone());
+        incoming.lock().push_back(expected.clone());
         notify.notify_one();
 
         let got = session.read_packet().await.unwrap().unwrap();
@@ -272,7 +274,7 @@ mod tests {
         crate::capsule::put_varint(&mut header_buf, 0); // quarter stream id 0
         let header = header_buf.freeze();
 
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = mpsc::bounded_async::<Vec<u8>>(8);
         let mut session = ConnectIpSession::with_capacity(
             Arc::new(Mutex::new(VecDeque::new())),
             Arc::new(Notify::new()),
@@ -313,7 +315,7 @@ mod tests {
         // the capacity to match the used size, so we assert that the
         // capacity after the loop is at most 2x the original (loose
         // bound to account for BytesMut growth policy).
-        let (tx, mut rx) = mpsc::channel::<Bytes>(64);
+        let (tx, rx) = mpsc::bounded_async::<Bytes>(64);
         let mut session = ConnectIpSession::with_capacity(
             Arc::new(Mutex::new(VecDeque::new())),
             Arc::new(Notify::new()),
