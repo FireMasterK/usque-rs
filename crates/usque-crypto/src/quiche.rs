@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use p256::ecdsa::SigningKey;
 use pem::Pem;
 use tempfile::TempDir;
 
 use crate::cert::generate_self_signed_cert;
+use crate::keys::SigningKey;
 
 /// Client TLS material for quiche/tokio-quiche (PEM files on disk).
 pub struct QuicheClientCredentials {

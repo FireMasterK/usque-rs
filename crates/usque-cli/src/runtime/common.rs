@@ -10,6 +10,18 @@ use usque_virtual_net::{ChannelDevice, VirtualStack};
 
 use crate::runtime::tunnel::build_connect_options;
 
+/// Default tunnel MTU: the largest value empirically measured to fit
+/// inside a single QUIC DATAGRAM against Cloudflare WARP. The QUIC
+/// stack (quinn) negotiates a path MTU of up to 1452 (its MTU-discovery
+/// ceiling); subtracting the QUIC short header (~25B), AEAD tag (16B)
+/// and DATAGRAM framing (quarter-stream-id + context-id, ~5B) leaves
+/// ~1406B of IP payload. 1400 is that ceiling rounded down; anything
+/// above it is silently dropped by the peer (`TooLarge` per packet).
+/// IPv6's minimum mandatory MTU is 1280, so 1400 keeps every modern
+/// path happy while carrying ~9% larger frames than the old 1280
+/// default ported from the Go client.
+pub const DEFAULT_TUNNEL_MTU: usize = 1400;
+
 #[derive(Debug, Args, Clone)]
 pub struct TunnelFlags {
     #[arg(short = 'P', long, default_value_t = 443)]
@@ -24,7 +36,7 @@ pub struct TunnelFlags {
     pub sni_address: String,
     #[arg(short = 'k', long = "keepalive-period", default_value = "30s")]
     pub keepalive_period: humantime::Duration,
-    #[arg(short = 'm', long, default_value_t = 1280)]
+    #[arg(short = 'm', long = "mtu", default_value_t = DEFAULT_TUNNEL_MTU)]
     pub mtu: usize,
     #[arg(short = 'i', long = "initial-packet-size", default_value_t = 0)]
     pub initial_packet_size: u16,

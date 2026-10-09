@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes};
 
 use crate::capsule::{put_varint, CAPSULE_CONNECT_IP_DATA};
 
@@ -46,11 +46,14 @@ pub fn decrement_ttl(packet: &mut [u8]) -> anyhow::Result<()> {
 }
 
 /// Encode the H3 datagram payload by writing the context-id varint
-/// followed by the packet into a caller-owned `BytesMut`. Assumes
+/// followed by the packet into a caller-owned buffer. Assumes
 /// the caller has already decremented the IP TTL/hop-limit.
-pub fn encode_h3_datagram_payload_into(packet: &[u8], out: &mut BytesMut) -> anyhow::Result<()> {
+///
+/// Generic over `BufMut` so the outbound path can encode directly into
+/// the final `Vec<u8>` payload (no intermediate `BytesMut` + copy).
+pub fn encode_h3_datagram_payload_into(packet: &[u8], out: &mut impl BufMut) -> anyhow::Result<()> {
     put_varint(out, CONTEXT_ID);
-    out.extend_from_slice(packet);
+    out.put_slice(packet);
     Ok(())
 }
 
@@ -74,7 +77,11 @@ pub fn decode_h3_datagram_payload_owned(data: &Bytes) -> Option<Bytes> {
 
 /// Wrap an IP packet for HTTP/2 CONNECT-IP (DATAGRAM capsule type 0).
 /// Assumes the caller has already decremented the IP TTL/hop-limit.
-pub fn encode_h2_datagram_capsule_into(packet: &[u8], out: &mut BytesMut) -> anyhow::Result<()> {
+/// Generic over `BufMut`; see [`encode_h3_datagram_payload_into`].
+pub fn encode_h2_datagram_capsule_into(
+    packet: &[u8],
+    out: &mut impl BufMut,
+) -> anyhow::Result<()> {
     crate::capsule::put_capsule(out, CAPSULE_CONNECT_IP_DATA, packet);
     Ok(())
 }
@@ -95,6 +102,7 @@ fn decode_varint_local(data: &Bytes) -> Option<(u64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
     #[test]
     fn h3_datagram_roundtrip() {

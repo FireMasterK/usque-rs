@@ -2,7 +2,10 @@ mod capsule;
 mod connect_ip;
 mod datagram;
 mod h2;
+#[cfg(feature = "quiche")]
 mod h3;
+#[cfg(feature = "quinn")]
+mod h3_quinn;
 mod session;
 
 use anyhow::Result;
@@ -18,7 +21,23 @@ pub async fn connect_tunnel(options: &ConnectOptions) -> Result<Box<dyn PacketSe
         let session = h2::connect_h2(options).await?;
         Ok(Box::new(session))
     } else {
-        let session = h3::connect_h3(options).await?;
-        Ok(Box::new(session))
+        connect_h3(options).await
     }
+}
+
+#[cfg(feature = "quinn")]
+async fn connect_h3(options: &ConnectOptions) -> Result<Box<dyn PacketSession>> {
+    let session = h3_quinn::connect_h3(options).await?;
+    Ok(Box::new(session))
+}
+
+#[cfg(all(not(feature = "quinn"), feature = "quiche"))]
+async fn connect_h3(options: &ConnectOptions) -> Result<Box<dyn PacketSession>> {
+    let session = h3::connect_h3(options).await?;
+    Ok(Box::new(session))
+}
+
+#[cfg(all(not(feature = "quinn"), not(feature = "quiche")))]
+async fn connect_h3(_options: &ConnectOptions) -> Result<Box<dyn PacketSession>> {
+    anyhow::bail!("no HTTP/3 QUIC backend enabled (enable `quinn` or `quiche`)")
 }

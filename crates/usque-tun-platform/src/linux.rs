@@ -4,32 +4,42 @@ use bytes::{Bytes, BytesMut};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tun::{AbstractDevice, AsyncDevice, Configuration};
+use tun::{AbstractDevice, AsyncDevice, Configuration, DeviceReader, DeviceWriter};
 
 use crate::{NativeTun, NativeTunConfig};
 use usque_tunnel_core::TunnelDevice;
 
-struct TunAsyncDevice(Arc<tokio::sync::Mutex<AsyncDevice>>);
+/// Split halves of the TUN file descriptor, each wrapped in its own
+/// `AsyncFd`. The previous design wrapped the whole `AsyncDevice` in
+/// a shared `tokio::sync::Mutex`, which coupled the two directions:
+/// `read_packet` held the lock across the entire `read().await`,
+/// which pends until a packet arrives from the kernel — so an
+/// inbound packet write stalled behind every pending read (and vice
+/// versa). The kernel already serializes `read`/`write` on one fd,
+/// and `DeviceReader`/`DeviceWriter` each keep their own readiness
+/// registration, so the mutex is unnecessary on Linux.
+struct TunAsyncDevice {
+    /// Guarded only because `AsyncReadExt` needs `&mut`; the
+    /// supervisor reads from a single task, so this mutex is never
+    /// contended and — crucially — no longer couples the write path
+    /// (the old design shared one mutex between both directions, so
+    /// every pending read blocked inbound writes).
+    reader: tokio::sync::Mutex<DeviceReader>,
+    writer: DeviceWriter,
+}
 
 #[async_trait]
 impl TunnelDevice for TunAsyncDevice {
     async fn read_packet(&self, buf: &mut BytesMut) -> io::Result<usize> {
-        // `tun::AsyncDevice`'s `AsyncRead` impl expects a `&mut [u8]`
-        // slice. The supervisor's scratch `BytesMut` has `len == 0` and
-        // `cap == MTU`, so dereffing gives a zero-length slice. Read
-        // into the spare capacity instead, then commit with `set_len`.
+        // `DeviceReader`'s `AsyncRead` impl expects a `&mut [u8]`
+        // slice. The supervisor's scratch `BytesMut` has `len == 0`
+        // and `cap == MTU`, so dereffing gives a zero-length slice.
+        // Read into the spare capacity instead, then commit with
+        // `set_len`.
         let spare = buf.spare_capacity_mut();
         let dst =
             unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), spare.len()) };
-        // Lock the inner `AsyncDevice` only for the duration of the
-        // syscall, never across an `await` outside it. Holding the
-        // lock across the `read().await` would deadlock the supervisor
-        // (the other arm needs the same lock to write an inbound
-        // packet).
-        let n = {
-            let mut dev = self.0.lock().await;
-            dev.read(dst).await?
-        };
+        let n = self.reader.lock().await.read(dst).await?;
         unsafe {
             buf.set_len(n);
         }
@@ -37,8 +47,10 @@ impl TunnelDevice for TunAsyncDevice {
     }
 
     async fn write_packet(&self, packet: Bytes) -> io::Result<()> {
-        let mut dev = self.0.lock().await;
-        dev.write_all(&packet).await?;
+        // `DeviceWriter` is `Clone` (cheap `Arc` bump) and polls the
+        // fd readiness lock-free; no read/write coupling.
+        let mut writer = self.writer.clone();
+        writer.write_all(&packet).await?;
         Ok(())
     }
 }
@@ -60,8 +72,14 @@ pub async fn create(cfg: NativeTunConfig) -> Result<NativeTun> {
         configure_link(&name, cfg.mtu, cfg.ipv4.as_deref(), cfg.ipv6.as_deref()).await?;
     }
 
+    // `split()` returns the writer first, then the reader.
+    let (writer, reader) = dev.split().context("failed to split TUN device")?;
+
     Ok(NativeTun {
-        device: Box::new(TunAsyncDevice(Arc::new(tokio::sync::Mutex::new(dev)))),
+        device: Box::new(TunAsyncDevice {
+            reader: tokio::sync::Mutex::new(reader),
+            writer,
+        }),
         name,
     })
 }

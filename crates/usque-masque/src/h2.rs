@@ -93,6 +93,7 @@ where
     let session = ConnectIpSession::new(Transport::H2 { out: out_tx });
     let incoming = session.incoming_queue();
     let notify = session.notify();
+    let closed = session.closed_flag();
 
     let mut recv_stream = response.into_body();
     tokio::spawn(async move {
@@ -122,6 +123,13 @@ where
                 None => break,
             }
         }
+        // The body stream ended or errored: mark the session closed
+        // and wake the supervisor. Without this, `read_packet` parks
+        // on the notify forever and the tunnel silently passes no
+        // traffic while the supervisor keeps waiting for a packet
+        // that can never arrive.
+        closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        notify.notify_waiters();
     });
 
     tokio::spawn(async move {

@@ -8,13 +8,17 @@ use boring::ssl::{
 use bytes::Bytes;
 use futures_util::SinkExt;
 use http::Uri;
-use p256::pkcs8::DecodePublicKey;
-use p256::PublicKey;
 use tokio::sync::mpsc;
 use tokio_quiche::datagram_socket::DgramBuffer;
 use tokio_quiche::http3::driver::{
     ClientH3Event, H3Event, InboundFrame, IncomingH3Headers, NewClientRequest, OutboundFrame,
 };
+
+/// Headroom reserved in front of every outbound payload so the
+/// tokio-quiche driver can prepend the quarter-stream-id varint in
+/// place (`try_add_prefix`) without shifting or copying the payload.
+/// Matches datagram-socket's `DGRAM_HEADROOM` contract (>= 8 bytes).
+const QUARTER_SID_HEADROOM: usize = 8;
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::quic::ConnectionHook;
 use tokio_quiche::quiche::h3::{self, NameValue};
@@ -24,13 +28,13 @@ use tokio_quiche::settings::{
 use tokio_quiche::{ClientH3Controller, ClientH3Driver};
 use tracing::debug;
 
-use usque_crypto::init as init_crypto;
+use usque_crypto::{init as init_crypto, PeerPublicKey};
 
 use crate::capsule::CapsuleReader;
 use crate::connect_ip::{ConnectIpSession, H3ConnectionGuard, Transport};
 
 struct PinnedKeyHook {
-    expected: PublicKey,
+    expected: PeerPublicKey,
 }
 
 impl ConnectionHook for PinnedKeyHook {
@@ -44,7 +48,7 @@ impl ConnectionHook for PinnedKeyHook {
             .set_private_key_file(settings.private_key, SslFiletype::PEM)
             .ok()?;
 
-        let expected = self.expected;
+        let expected = self.expected.clone();
         builder.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
             let cert = ssl
                 .peer_certificate()
@@ -55,9 +59,7 @@ impl ConnectionHook for PinnedKeyHook {
             let der = pkey
                 .public_key_to_der()
                 .map_err(|_| SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN))?;
-            let peer = PublicKey::from_public_key_der(&der)
-                .map_err(|_| SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN))?;
-            if peer != expected {
+            if der.as_slice() != expected.as_der() {
                 return Err(SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN));
             }
             Ok(())
@@ -118,7 +120,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
     } else {
         Hooks {
             connection_hook: Some(Arc::new(PinnedKeyHook {
-                expected: options.peer_public_key,
+                expected: options.peer_public_key.clone(),
             })),
         }
     };
@@ -141,7 +143,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
 
     send_connect_request(&mut controller, options)?;
 
-    let (dgram_out_tx, mut dgram_out_rx) = mpsc::channel::<Bytes>(64);
+    let (dgram_out_tx, mut dgram_out_rx) = mpsc::channel::<Vec<u8>>(64);
     let incoming = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
     let notify = Arc::new(tokio::sync::Notify::new());
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -178,11 +180,12 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
                         };
                         if let InboundFrame::Datagram(dgram) = frame {
                             // dgram is an owned DgramBuffer (Vec<u8> wrapper).
-                            // datagram-socket 0.8 doesn't expose into_inner(),
-                            // so we copy into a Bytes here. The downstream
-                            // pipeline (CapsuleReader, supervisor) is now
-                            // zero-copy from this Bytes onward.
-                            let bytes = bytes::Bytes::copy_from_slice(dgram.as_slice());
+                            // `into_parts` moves the inner Vec out (no copy) and
+                            // reports the read cursor; `Bytes::from(vec)` wraps
+                            // it and `.slice(start..)` only bumps the refcount,
+                            // so the downstream pipeline stays zero-copy.
+                            let (vec, start) = dgram.into_parts();
+                            let bytes = Bytes::from(vec).slice(start..);
                             if let Some(packet) =
                                 crate::datagram::decode_h3_datagram_payload_owned(&bytes)
                             {
@@ -191,6 +194,12 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
                             }
                         }
                     }
+                    // The flow's datagram stream ended: mark the
+                    // session closed and wake the supervisor so
+                    // `read_packet` returns `Ok(None)` (reconnect)
+                    // instead of parking forever.
+                    closed_recv.store(true, Ordering::Relaxed);
+                    notify_recv.notify_waiters();
                 });
             }
             ClientH3Event::Core(H3Event::IncomingHeaders(headers)) => {
@@ -223,7 +232,11 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
     tokio::spawn(async move {
         let mut send = send;
         while let Some(payload) = dgram_out_rx.recv().await {
-            let dgram = DgramBuffer::from_slice(payload.as_ref());
+            // The payload Vec already carries QUARTER_SID_HEADROOM zero
+            // bytes up front (reserved by `write_packet`); wrapping it
+            // moves the buffer instead of copying it, and the driver
+            // prepends the quarter-stream-id into that headroom.
+            let dgram = DgramBuffer::from_vec_with_headroom(payload, QUARTER_SID_HEADROOM);
             if send
                 .send(OutboundFrame::Datagram(dgram, fid))
                 .await

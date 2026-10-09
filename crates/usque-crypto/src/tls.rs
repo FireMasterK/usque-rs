@@ -1,30 +1,28 @@
 use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
-use p256::ecdsa::SigningKey;
-use p256::PublicKey;
-use pkcs8::DecodePublicKey;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 
 use crate::cert::generate_self_signed_cert;
+use crate::keys::{PeerPublicKey, SigningKey};
 
 static CRYPTO_PROVIDER: Once = Once::new();
 
-/// Install the process-wide rustls `ring` backend. Safe to call multiple times.
+/// Install the process-wide rustls `aws-lc-rs` backend. Safe to call multiple times.
 pub fn init() {
     CRYPTO_PROVIDER.call_once(|| {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
-            .expect("failed to install rustls ring crypto provider");
+            .expect("failed to install rustls aws-lc-rs crypto provider");
     });
 }
 
 pub struct TlsOptions {
     pub sni: String,
     pub insecure: bool,
-    pub peer_public_key: PublicKey,
+    pub peer_public_key: PeerPublicKey,
     pub alpn: Vec<Vec<u8>>,
 }
 
@@ -41,7 +39,7 @@ pub fn build_rustls_config(
         Arc::new(InsecureVerifier)
     } else {
         Arc::new(PinnedKeyVerifier {
-            expected: options.peer_public_key,
+            expected: options.peer_public_key.clone(),
         })
     };
 
@@ -102,7 +100,7 @@ impl ServerCertVerifier for InsecureVerifier {
 
 #[derive(Debug)]
 struct PinnedKeyVerifier {
-    expected: PublicKey,
+    expected: PeerPublicKey,
 }
 
 impl ServerCertVerifier for PinnedKeyVerifier {
@@ -118,10 +116,7 @@ impl ServerCertVerifier for PinnedKeyVerifier {
             .map_err(|_| RustlsError::General("failed to parse server certificate".into()))?;
 
         let spki = cert.public_key();
-        let peer = PublicKey::from_public_key_der(spki.raw)
-            .map_err(|_| RustlsError::General("server certificate is not ECDSA P-256".into()))?;
-
-        if peer != self.expected {
+        if spki.raw != self.expected.as_der() {
             return Err(RustlsError::General(
                 "remote endpoint has a different public key than what we trust in config".into(),
             ));
@@ -158,17 +153,21 @@ impl ServerCertVerifier for PinnedKeyVerifier {
 
 #[cfg(test)]
 mod tests {
-    use p256::{ecdsa::SigningKey, elliptic_curve::Generate};
-    use pkcs8::EncodePublicKey;
+    use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    use base64::Engine as _;
 
     use super::*;
 
     #[test]
     fn init_and_build_config() {
         init();
-        let signing_key = SigningKey::generate();
-        let peer_der = signing_key.verifying_key().to_public_key_der().unwrap();
-        let peer_key = PublicKey::from_public_key_der(peer_der.as_bytes()).unwrap();
+        let signing_key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
+        let peer_der = crate::keys::public_key_spki_der(&signing_key).unwrap();
+        let peer_key = crate::keys::decode_endpoint_public_key(&format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            base64::engine::general_purpose::STANDARD.encode(&peer_der)
+        ))
+        .unwrap();
 
         build_rustls_config(
             &signing_key,

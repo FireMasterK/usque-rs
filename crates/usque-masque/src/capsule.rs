@@ -16,7 +16,11 @@ pub const CAPSULE_CONNECT_IP_REQUEST: u64 = 0x04;
 /// silently corrupts any capsule whose payload length is >= 64, because the
 /// peer then reads the length prefix as a multi-byte varint and the capsule
 /// stream desynchronizes.
-pub fn put_varint(out: &mut BytesMut, value: u64) {
+///
+/// Generic over `BufMut` so callers can encode into either a `BytesMut`
+/// scratch or a `Vec<u8>` scratch (`Vec<u8>` implements `BufMut`), letting
+/// the outbound path build payload buffers without a final `memcpy`.
+pub fn put_varint(out: &mut impl BufMut, value: u64) {
     if value < 64 {
         out.put_u8(value as u8);
     } else if value < 16_384 {
@@ -39,10 +43,10 @@ pub fn put_varint(out: &mut BytesMut, value: u64) {
     }
 }
 
-pub fn put_capsule(out: &mut BytesMut, capsule_type: u64, value: &[u8]) {
+pub fn put_capsule(out: &mut impl BufMut, capsule_type: u64, value: &[u8]) {
     put_varint(out, capsule_type);
     put_varint(out, value.len() as u64);
-    out.extend_from_slice(value);
+    out.put_slice(value);
 }
 
 /// Worst-case byte overhead of a CONNECT-IP DATA capsule with the

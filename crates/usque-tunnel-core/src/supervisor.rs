@@ -105,8 +105,17 @@ impl TunnelSupervisor {
                         } => match read {
                             Ok(n) if n > 0 && is_valid_ip_packet(&wait_buf[..n]) => {
                                 info!("Detected outbound activity ({n} bytes). Reconnecting...");
-                                let head = wait_buf.split_to(n);
-                                pending_outbound = Some(head.freeze());
+                                // Copy the triggering packet out and
+                                // reset `wait_buf` in place. The old
+                                // `split_to(n).freeze()` advanced the
+                                // buffer's pointer by `n` per activity
+                                // detection, shrinking `wait_buf`'s
+                                // apparent capacity across reconnect
+                                // cycles until reads silently
+                                // truncated to 0 bytes and activity
+                                // detection stopped working.
+                                pending_outbound = Some(Bytes::copy_from_slice(&wait_buf[..n]));
+                                wait_buf.clear();
                                 break;
                             }
                             Ok(_) => {}
@@ -142,7 +151,7 @@ impl TunnelSupervisor {
             info!("Connected to MASQUE server");
 
             if let Some(packet) = pending_outbound.take() {
-                if let Err(err) = session.write_packet(packet).await {
+                if let Err(err) = session.write_packet(&packet).await {
                     warn!("Failed to forward pending outbound packet: {err}");
                 }
             }
@@ -154,7 +163,7 @@ impl TunnelSupervisor {
                 run_hook(&cfg.on_connect, env);
             }
 
-            let err = Self::run_pumps(&cfg, &device, session.as_mut()).await;
+            let err = Self::run_pumps(cfg.mtu, &device, session.as_mut()).await;
 
             if !cfg.on_disconnect.is_empty() {
                 let mut env = cfg.hook_env.clone();
@@ -170,22 +179,18 @@ impl TunnelSupervisor {
     }
 
     async fn run_pumps<D>(
-        cfg: &MaintainTunnelConfig,
+        mtu: usize,
         device: &Arc<D>,
         session: &mut dyn PacketSession,
     ) -> SessionError
     where
         D: TunnelDevice + 'static,
     {
-        // Reusable scratch buffer for outbound packets. Recycled each
-        // iteration by replacing it with a fresh allocation — we
-        // can't reuse the same `BytesMut` because `split_to(n).freeze()`
-        // advances the underlying pointer by `n`, so after enough
-        // iterations the buffer's apparent capacity shrinks to zero
-        // and `read_packet` silently truncates every subsequent
-        // packet to 0 bytes (caught as a long-standing
-        // "first 3 SOCKS requests work, the rest time out" bug).
-        let mtu = cfg.mtu;
+        // Reusable scratch buffer for outbound packets. The packet
+        // is lent to the session as `&to_tunnel[..n]` and stays in
+        // place, so there is no per-packet reallocation here (and no
+        // `split_to` pointer-advance to guard against — reusing the
+        // same allocation is now safe because nothing advances it).
         let mut to_tunnel = BytesMut::with_capacity(mtu);
         let mut pkt_count: u64 = 0;
         tracing::info!("run_pumps starting, mtu={mtu}");
@@ -217,22 +222,20 @@ impl TunnelSupervisor {
                                 tracing::debug!("tunnel: skipping packet: {err}");
                                 continue;
                             }
-                            // Detach the first `n` bytes from the scratch
-                            // and replace the scratch with a fresh
-                            // allocation. `BytesMut::split_to(n).freeze()`
-                            // is zero-copy for the resulting `Bytes`, but
-                            // it advances the scratch's underlying pointer
-                            // by `n`; reusing the scratch in subsequent
-                            // iterations would shrink its capacity to
-                            // zero after ~MTU/avg_pkt iterations. The
-                            // `to_tunnel` allocation is a single
-                            // amortised allocation per packet — cheap,
-                            // and far cheaper than the original silent
-                            // packet drops it was causing.
-                            let head = to_tunnel.split_to(n);
-                            let packet = head.freeze();
-                            to_tunnel = BytesMut::with_capacity(mtu);
-                            match session.write_packet(packet).await {
+                            // The packet stays in the reusable scratch
+                            // and is lent to the session as a slice:
+                            // every session implementation copies
+                            // into its own prefix-encoding scratch
+                            // anyway, so the old
+                            // `split_to(n).freeze()` +
+                            // `BytesMut::with_capacity(mtu)` dance
+                            // cost one heap allocation per outbound
+                            // packet to produce a `Bytes` that was
+                            // copied and dropped immediately (the
+                            // `split_to` also advanced the buffer
+                            // pointer, which is why the scratch had
+                            // to be rebuilt each iteration).
+                            match session.write_packet(&to_tunnel[..n]).await {
                                 Ok(Some(icmp)) => {
                                     if let Err(err) = device.write_packet(icmp).await {
                                         return SessionError::Other(anyhow::anyhow!(
@@ -253,7 +256,20 @@ impl TunnelSupervisor {
                 }
                 session_read = session.read_packet() => {
                     match session_read {
-                        Ok(None) => continue,
+                        Ok(None) => {
+                            // `Ok(None)` means the session is closed
+                            // (e.g. the QUIC connection hit its idle
+                            // timeout). Returning here tears down the
+                            // pumps so `maintain` can reconnect; the
+                            // old `continue` re-armed the same closed
+                            // session and spun the core to 100% with
+                            // zero forward progress until some other
+                            // arm happened to error out (observed as
+                            // a tunnel that silently stops passing
+                            // traffic for minutes while pegging a
+                            // CPU).
+                            return SessionError::Closed;
+                        }
                         Ok(Some(packet)) => {
                             tracing::debug!("tunnel: masque -> device ({} bytes)", packet.len());
                             log_ipv4_packet("in", &packet);
@@ -268,5 +284,78 @@ impl TunnelSupervisor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Device that never produces packets (parks forever on read).
+    struct NoPacketDevice;
+
+    #[async_trait::async_trait]
+    impl TunnelDevice for NoPacketDevice {
+        async fn read_packet(&self, _buf: &mut BytesMut) -> io::Result<usize> {
+            std::future::pending().await
+        }
+
+        async fn write_packet(&self, _packet: Bytes) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Session that reports "closed" on every read. `run_pumps` used
+    /// to `continue` on this, re-arming the same closed session and
+    /// spinning a core at 100% while the tunnel silently passed no
+    /// traffic (observed live: `h3 datagram read error: Timeout`
+    /// followed by 10 minutes with no reconnect). It must instead
+    /// return `SessionError::Closed` so `maintain` can reconnect.
+    struct ClosedSession {
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PacketSession for ClosedSession {
+        async fn read_packet(&mut self) -> Result<Option<Bytes>, SessionError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+
+        async fn write_packet(&mut self, _packet: &[u8]) -> Result<Option<Bytes>, SessionError> {
+            Ok(None)
+        }
+
+        async fn close(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_pumps_returns_closed_when_session_reports_closed() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut session = ClosedSession {
+            reads: Arc::clone(&reads),
+        };
+        let device = Arc::new(NoPacketDevice);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            TunnelSupervisor::run_pumps(1280, &device, &mut session),
+        )
+        .await
+        .expect("run_pumps must not busy-loop on a closed session");
+
+        assert!(
+            matches!(result, SessionError::Closed),
+            "expected SessionError::Closed, got {result:?}"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "pumps must return after the first closed read, not keep re-arming"
+        );
     }
 }

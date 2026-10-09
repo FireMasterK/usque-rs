@@ -1,14 +1,12 @@
 use anyhow::{Context, Result};
-use p256::ecdsa::SigningKey;
-use pkcs8::EncodePrivateKey;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls_pki_types::PrivatePkcs8KeyDer;
 
+use crate::keys::{private_key_pkcs8_der, SigningKey};
+
 pub fn generate_self_signed_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, Vec<u8>)> {
-    let key_der = signing_key
-        .to_pkcs8_der()
-        .context("failed to marshal private key")?;
-    let key_der = PrivatePkcs8KeyDer::from(key_der.as_bytes().to_vec());
+    let key_der = private_key_pkcs8_der(signing_key)?;
+    let key_der = PrivatePkcs8KeyDer::from(key_der);
     let key_pair = KeyPair::from_pkcs8_der_and_sign_algo(&key_der, &PKCS_ECDSA_P256_SHA256)
         .context("failed to build key pair")?;
 

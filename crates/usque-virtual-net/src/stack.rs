@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -17,6 +18,7 @@ use smoltcp::wire::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
@@ -39,6 +41,10 @@ impl StackClock {
 struct ChannelPhy {
     rx: VecDeque<Bytes>,
     tx: mpsc::UnboundedSender<Bytes>,
+    /// MTU reported to smoltcp. Must match the tunnel MTU so the
+    /// userspace stack never emits a frame the QUIC datagram path
+    /// cannot carry.
+    mtu: usize,
     recent_syns: Arc<std::sync::Mutex<VecDeque<SynFingerprint>>>,
     /// Reusable transmit scratch buffer. The smoltcp driver creates
     /// a new `TxToken` for every transmit but only one is alive at a
@@ -58,10 +64,11 @@ struct ChannelPhy {
 }
 
 impl ChannelPhy {
-    fn new(tx: mpsc::UnboundedSender<Bytes>) -> Self {
+    fn new(tx: mpsc::UnboundedSender<Bytes>, mtu: usize) -> Self {
         Self {
             rx: VecDeque::new(),
             tx,
+            mtu,
             recent_syns: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(16))),
             tx_scratch: Arc::new(std::sync::Mutex::new(BytesMut::new())),
         }
@@ -292,7 +299,7 @@ impl Device for ChannelPhy {
 
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut caps = phy::DeviceCapabilities::default();
-        caps.max_transmission_unit = 1280;
+        caps.max_transmission_unit = self.mtu;
         caps.medium = Medium::Ip;
         caps.checksum.ipv4 = phy::Checksum::Tx;
         caps.checksum.tcp = phy::Checksum::Tx;
@@ -331,10 +338,42 @@ struct SynFingerprint {
     seq: u32,
 }
 
+/// Retire request queued when a stream/socket owner is dropped.
+#[derive(Clone, Copy)]
+struct ReapRequest {
+    handle: SocketHandle,
+    kind: ReapKind,
+    /// Ticks spent waiting for a TCP handshake to finish; force
+    /// removal after `MAX_REAP_ATTEMPTS` so a wedged connection
+    /// cannot pin its buffer forever.
+    attempts: u32,
+}
+
+#[derive(Clone, Copy)]
+enum ReapKind {
+    /// Removed on the next drain tick (owner gone; queued response
+    /// packets are useless).
+    Udp,
+    /// Removed once the TCP state machine reaches `Closed` (so the
+    /// FIN exchange still goes out).
+    Tcp,
+}
+
+/// 10ms stack poll tick × 600 ≈ 6s grace before force removal.
+const MAX_REAP_ATTEMPTS: u32 = 600;
+
 struct StackInner {
     iface: Interface,
     device: ChannelPhy,
     sockets: SocketSet<'static>,
+    /// Reap requests not yet removable, retried on each drain tick.
+    /// Invariant: a request for `handle` exists only while the
+    /// original socket still occupies that slot — requests are
+    /// enqueued by `Drop` (socket still in the set) and dequeued in
+    /// the same drain that removes the socket, so an index reused by
+    /// a later `SocketSet::add` can never be reclaimed by a stale
+    /// request.
+    pending_reaps: Vec<ReapRequest>,
 }
 
 impl StackInner {
@@ -344,17 +383,113 @@ impl StackInner {
                 .poll(clock.now(), &mut self.device, &mut self.sockets);
         }
     }
+
+    /// True when `handle` still refers to a live socket.
+    /// `SocketSet::get[_mut]` panics on stale handles, so every path
+    /// that may have had its socket reaped checks this first.
+    fn has_socket(&self, handle: SocketHandle) -> bool {
+        self.sockets.iter().any(|(h, _)| h == handle)
+    }
+
+    /// TCP state if the socket is still live, else `None`.
+    fn tcp_state(&self, handle: SocketHandle) -> Option<tcp::State> {
+        if self.has_socket(handle) {
+            Some(self.sockets.get::<tcp::Socket>(handle).state())
+        } else {
+            None
+        }
+    }
+
+    /// Process socket-reaping requests from dropped owners. UDP
+    /// sockets are removed immediately; TCP sockets first get
+    /// `close()` (idempotent — kicks off the FIN handshake even if
+    /// the owner never called `poll_shutdown`, advances one step per
+    /// tick) and are removed once `Closed`, or force-removed after
+    /// `MAX_REAP_ATTEMPTS` (~6s) so nothing pins 128KB forever. The
+    /// socket set previously only ever grew: every proxied TCP
+    /// connection and every DNS lookup leaked for the process
+    /// lifetime.
+    fn drain_reap_queue(&mut self, incoming: &std::sync::Mutex<Vec<ReapRequest>>) {
+        {
+            let mut q = incoming.lock().expect("reap queue poisoned");
+            if !q.is_empty() {
+                self.pending_reaps.append(&mut q);
+            }
+        }
+        if self.pending_reaps.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.pending_reaps.len() {
+            let req = self.pending_reaps[i];
+            if !self.has_socket(req.handle) {
+                self.pending_reaps.swap_remove(i);
+                continue;
+            }
+            match req.kind {
+                ReapKind::Udp => {
+                    self.sockets.remove(req.handle);
+                    self.pending_reaps.swap_remove(i);
+                }
+                ReapKind::Tcp => match self.tcp_state(req.handle) {
+                    None => {
+                        self.pending_reaps.swap_remove(i);
+                    }
+                    Some(tcp::State::Closed) => {
+                        self.sockets.remove(req.handle);
+                        self.pending_reaps.swap_remove(i);
+                    }
+                    Some(_) => {
+                        if req.attempts + 1 >= MAX_REAP_ATTEMPTS {
+                            self.sockets.remove(req.handle);
+                            self.pending_reaps.swap_remove(i);
+                        } else {
+                            // Progress the handshake (no-op if
+                            // already closing) then wait a tick.
+                            self.sockets
+                                .get_mut::<tcp::Socket>(req.handle)
+                                .close();
+                            self.pending_reaps[i].attempts += 1;
+                            i += 1;
+                        }
+                    }
+                },
+            }
+        }
+    }
 }
 
 pub struct StackShared {
     inner: Mutex<StackInner>,
-    notify: Notify,
+    /// `Arc` (rather than a plain `Notify` in this struct) so parked
+    /// readers/writers can register `OwnedNotified` waiters, which
+    /// take `Arc<Notify>` by value.
+    notify: Arc<Notify>,
+    /// Sockets to retire once their owner (`VirtualTcpStream` /
+    /// `VirtualUdpSocket`) is dropped. A sync mutex, because `Drop`
+    /// runs on the sync side and must not touch the async `inner`
+    /// lock; drained by the stack poll task under `inner`.
+    reap: std::sync::Mutex<Vec<ReapRequest>>,
     clock: StackClock,
 }
 
 pub struct VirtualTcpStream {
     handle: SocketHandle,
     shared: Arc<StackShared>,
+    /// Read-side waiter registered on `StackShared::notify` while a
+    /// read finds no data on an open socket. `OwnedNotified` is
+    /// `!Unpin` (self-referential waiter node), hence `Pin<Box<_>>`;
+    /// storing it across polls keeps one stable registration alive —
+    /// returning `Pending` without a registered waker would park the
+    /// task forever, and the old `wake_by_ref()` turned every idle
+    /// connection into a busy loop (3 idle SOCKS connections pinned
+    /// 2.6 CPU cores). Separate slot from `write_waiter` so a
+    /// bidirectional relay can park on both directions at once.
+    read_waiter: Option<Pin<Box<OwnedNotified>>>,
+    /// Write-side waiter, same purpose for a full send window
+    /// (`send_slice` returns `Ok(0)`): without it a blocked writer
+    /// also busy-spun.
+    write_waiter: Option<Pin<Box<OwnedNotified>>>,
 }
 
 impl AsyncRead for VirtualTcpStream {
@@ -372,26 +507,53 @@ impl AsyncRead for VirtualTcpStream {
             }
         };
 
-        let socket = inner.sockets.get_mut::<tcp::Socket>(this.handle);
-        let unfilled = buf.initialize_unfilled();
-        match socket.recv_slice(unfilled) {
-            Ok(0) => match socket.state() {
-                tcp::State::Closed | tcp::State::TimeWait => Poll::Ready(Ok(())),
-                _ => {
-                    inner.poll(&this.shared.clock);
-                    drop(inner);
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+        // Loop so that a fired waiter re-checks for data without
+        // leaving the lock: registering the waiter must happen while
+        // we still hold `inner`, otherwise the stack poll task can
+        // process a packet and run `notify_waiters()` between our
+        // empty read and the registration (lost wakeup, recovered
+        // only by the 10ms fallback tick).
+        loop {
+            let socket = inner.sockets.get_mut::<tcp::Socket>(this.handle);
+            let unfilled = buf.initialize_unfilled();
+            match socket.recv_slice(unfilled) {
+                Ok(0) => match socket.state() {
+                    tcp::State::Closed | tcp::State::TimeWait => return Poll::Ready(Ok(())),
+                    _ => {
+                        inner.poll(&this.shared.clock);
+                        // Idle open socket with no data: park on the
+                        // shared notify instead of the old
+                        // `wake_by_ref()` spin (3 idle held SOCKS
+                        // connections pinned 2.6 CPU cores). Every
+                        // stack poll — packet arrival *and* the 10ms
+                        // tick — calls `notify_waiters()`, so FIN/RST
+                        // transitions also wake us.
+                        let waiter = this.read_waiter.get_or_insert_with(|| {
+                            Box::pin(Arc::clone(&this.shared.notify).notified_owned())
+                        });
+                        match waiter.as_mut().poll(cx) {
+                            Poll::Ready(()) => {
+                                // Woken: drop the consumed waiter and
+                                // re-check for data under the lock.
+                                this.read_waiter = None;
+                                continue;
+                            }
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                },
+                Ok(n) => {
+                    buf.advance(n);
+                    // Data found without the waiter firing (e.g. a
+                    // spurious task wake): discard any stale waiter.
+                    this.read_waiter = None;
+                    return Poll::Ready(Ok(()));
                 }
-            },
-            Ok(n) => {
-                buf.advance(n);
-                Poll::Ready(Ok(()))
+                Err(tcp::RecvError::InvalidState) => {
+                    return Poll::Ready(Err(io::ErrorKind::NotConnected.into()))
+                }
+                Err(tcp::RecvError::Finished) => return Poll::Ready(Ok(())),
             }
-            Err(tcp::RecvError::InvalidState) => {
-                Poll::Ready(Err(io::ErrorKind::NotConnected.into()))
-            }
-            Err(tcp::RecvError::Finished) => Poll::Ready(Ok(())),
         }
     }
 }
@@ -402,6 +564,12 @@ impl AsyncWrite for VirtualTcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // A zero-length write must not park: `send_slice` reports
+        // `Ok(0)` for an empty input, indistinguishable from "send
+        // window full".
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         let this = self.get_mut();
         let mut inner = match this.shared.inner.try_lock() {
             Ok(inner) => inner,
@@ -411,21 +579,36 @@ impl AsyncWrite for VirtualTcpStream {
             }
         };
 
-        let socket = inner.sockets.get_mut::<tcp::Socket>(this.handle);
-        match socket.send_slice(buf) {
-            Ok(0) => {
-                inner.poll(&this.shared.clock);
-                drop(inner);
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Ok(n) => {
-                inner.poll(&this.shared.clock);
-                this.shared.notify.notify_waiters();
-                Poll::Ready(Ok(n))
-            }
-            Err(tcp::SendError::InvalidState) => {
-                Poll::Ready(Err(io::ErrorKind::NotConnected.into()))
+        // Same lock-held registration pattern as `poll_read`: a
+        // blocked writer (full send window) parks on the shared
+        // notify, which the stack poll task signals after every
+        // window-advancing ACK and on the 10ms tick, instead of the
+        // old immediate `wake_by_ref()` busy-spin.
+        loop {
+            let socket = inner.sockets.get_mut::<tcp::Socket>(this.handle);
+            match socket.send_slice(buf) {
+                Ok(0) => {
+                    inner.poll(&this.shared.clock);
+                    let waiter = this.write_waiter.get_or_insert_with(|| {
+                        Box::pin(Arc::clone(&this.shared.notify).notified_owned())
+                    });
+                    match waiter.as_mut().poll(cx) {
+                        Poll::Ready(()) => {
+                            this.write_waiter = None;
+                            continue;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                Ok(n) => {
+                    inner.poll(&this.shared.clock);
+                    this.write_waiter = None;
+                    this.shared.notify.notify_waiters();
+                    return Poll::Ready(Ok(n));
+                }
+                Err(tcp::SendError::InvalidState) => {
+                    return Poll::Ready(Err(io::ErrorKind::NotConnected.into()))
+                }
             }
         }
     }
@@ -439,6 +622,10 @@ impl AsyncWrite for VirtualTcpStream {
         if let Ok(mut inner) = this.shared.inner.try_lock() {
             inner.sockets.get_mut::<tcp::Socket>(this.handle).close();
             inner.poll(&this.shared.clock);
+            // Wake anyone parked in `poll_read`/`poll_write` so a
+            // closed stream resolves instead of waiting for the
+            // 10ms tick.
+            this.shared.notify.notify_waiters();
         }
         Poll::Ready(Ok(()))
     }
@@ -447,6 +634,42 @@ impl AsyncWrite for VirtualTcpStream {
 pub struct VirtualUdpSocket {
     handle: SocketHandle,
     shared: Arc<StackShared>,
+}
+
+impl Drop for VirtualTcpStream {
+    fn drop(&mut self) {
+        // Free the smoltcp socket (128KB of TX/RX buffer) instead of
+        // leaving it in the `SocketSet` forever. The poll task
+        // finishes the FIN handshake before actually removing it
+        // (or force-removes after ~6s).
+        self.shared
+            .reap
+            .lock()
+            .expect("reap queue poisoned")
+            .push(ReapRequest {
+                handle: self.handle,
+                kind: ReapKind::Tcp,
+                attempts: 0,
+            });
+        // Wake the poll task so the drain happens promptly even
+        // without waiting for the 10ms tick to elapse naturally.
+        self.shared.notify.notify_waiters();
+    }
+}
+
+impl Drop for VirtualUdpSocket {
+    fn drop(&mut self) {
+        self.shared
+            .reap
+            .lock()
+            .expect("reap queue poisoned")
+            .push(ReapRequest {
+                handle: self.handle,
+                kind: ReapKind::Udp,
+                attempts: 0,
+            });
+        self.shared.notify.notify_waiters();
+    }
 }
 
 impl VirtualUdpSocket {
@@ -540,12 +763,12 @@ impl VirtualStack {
     pub fn start(
         local_v4: Option<IpAddr>,
         local_v6: Option<IpAddr>,
-        _mtu: usize,
+        mtu: usize,
         from_tunnel: mpsc::UnboundedReceiver<Bytes>,
         to_tunnel: mpsc::UnboundedSender<Bytes>,
         activity: Arc<Notify>,
     ) -> Self {
-        let mut device = ChannelPhy::new(to_tunnel.clone());
+        let mut device = ChannelPhy::new(to_tunnel.clone(), mtu);
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = rand::random();
         let clock = StackClock::new();
@@ -575,11 +798,13 @@ impl VirtualStack {
             iface,
             device,
             sockets: SocketSet::new(vec![]),
+            pending_reaps: Vec::new(),
         };
 
         let shared = Arc::new(StackShared {
             inner: Mutex::new(inner),
-            notify: Notify::new(),
+            notify: Arc::new(Notify::new()),
+            reap: std::sync::Mutex::new(Vec::new()),
             clock,
         });
 
@@ -652,9 +877,24 @@ impl VirtualStack {
                         return Ok(VirtualTcpStream {
                             handle,
                             shared: Arc::clone(&self.shared),
+                            read_waiter: None,
+                            write_waiter: None,
                         });
                     }
                     tcp::State::Closed | tcp::State::TimeWait => {
+                        // No stream owner will ever be created, so
+                        // enqueue the reap here — otherwise a refused
+                        // connection leaves its socket (and 128KB of
+                        // buffer) in the set forever.
+                        self.shared
+                            .reap
+                            .lock()
+                            .expect("reap queue poisoned")
+                            .push(ReapRequest {
+                                handle,
+                                kind: ReapKind::Tcp,
+                                attempts: 0,
+                            });
                         return Err(io::Error::new(
                             io::ErrorKind::ConnectionRefused,
                             "tcp connection closed",
@@ -665,6 +905,15 @@ impl VirtualStack {
             }
 
             if tokio::time::Instant::now() >= deadline {
+                self.shared
+                    .reap
+                    .lock()
+                    .expect("reap queue poisoned")
+                    .push(ReapRequest {
+                        handle,
+                        kind: ReapKind::Tcp,
+                        attempts: 0,
+                    });
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "tcp connect timed out",
@@ -690,11 +939,13 @@ async fn run_poll_loop(mut from_tunnel: mpsc::UnboundedReceiver<Bytes>, shared: 
                 let mut inner = shared.inner.lock().await;
                 inner.device.push_rx(packet);
                 inner.poll(&shared.clock);
+                inner.drain_reap_queue(&shared.reap);
                 shared.notify.notify_waiters();
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
                 let mut inner = shared.inner.lock().await;
                 inner.poll(&shared.clock);
+                inner.drain_reap_queue(&shared.reap);
                 shared.notify.notify_waiters();
             }
         }

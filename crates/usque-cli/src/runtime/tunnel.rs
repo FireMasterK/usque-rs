@@ -26,7 +26,7 @@ pub fn build_connect_options(config: &Config, flags: &TunnelFlags) -> Result<Con
         TlsOptions {
             sni: flags.sni_address.clone(),
             insecure: flags.insecure,
-            peer_public_key: peer_key,
+            peer_public_key: peer_key.clone(),
             alpn,
         },
     )?;

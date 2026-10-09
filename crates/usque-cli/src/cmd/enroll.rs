@@ -3,10 +3,11 @@ use std::io::{self, Write};
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Args;
-use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use usque_cloudflare_api::{self, CloudflareClient, INVALID_PUBLIC_KEY};
 use usque_config::{parse_endpoint_v4, parse_endpoint_v6, Config, DEFAULT_ENDPOINT_H2_V4};
-use usque_crypto::{decode_private_key, generate_ec_keypair};
+use usque_crypto::{
+    decode_private_key, generate_ec_keypair, private_key_pkcs8_der, public_key_spki_der,
+};
 
 use crate::runtime::load_config;
 
@@ -28,8 +29,8 @@ pub async fn run(args: EnrollArgs, config_path: &str) -> Result<()> {
     } else {
         let key = decode_private_key(&existing.private_key)?;
         (
-            key.to_pkcs8_der()?.as_bytes().to_vec(),
-            key.verifying_key().to_public_key_der()?.to_vec(),
+            private_key_pkcs8_der(&key)?,
+            public_key_spki_der(&key)?,
         )
     };
 

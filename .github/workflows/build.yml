@@ -18,6 +18,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Vendor patched h3
+        run: bash vendor/prepare_h3.sh
+
       - uses: rui314/setup-mold@v1
 
       - name: Cache Rust artifacts

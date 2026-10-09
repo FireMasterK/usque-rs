@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         TlsOptions {
             sni: usque_cloudflare_api::CONNECT_SNI.to_string(),
             insecure: false,
-            peer_public_key: peer_key,
+            peer_public_key: peer_key.clone(),
             alpn: vec![b"h3".to_vec()],
         },
     )?;
