@@ -51,7 +51,7 @@ quinn = {version = "0.11", default-features = false, features = ["runtime-tokio"
 rand = "0.10"
 rcgen = {version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"]}
 reqwest = {version = "0.13", default-features = false, features = ["json", "rustls-no-provider"]}
-rtnetlink = "0.23"
+rtnetlink = "0.24"
 rustls = {version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "logging", "tls12"]}
 rustls-pemfile = "2"
 rustls-pki-types = "1"
