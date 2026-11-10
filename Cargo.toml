@@ -35,7 +35,7 @@ fast-socks5 = "1"
 futures = "0.3"
 futures-util = "0.3"
 h2 = "0.4"
-h3 = "0.0.8"
+h3 = {version = "0.0.8", features = ["tracing"]}
 h3-datagram = "0.0.2"
 h3-quinn = {version = "0.0.10", features = ["datagram"]}
 hex = "0.4"

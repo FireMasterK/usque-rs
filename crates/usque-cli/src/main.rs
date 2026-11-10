@@ -13,8 +13,15 @@ async fn main() -> Result<()> {
     // multi-core; idempotent, so library-level callers are safe too.
     crossfire::detect_backoff_cfg();
 
+    // `h3=info` is deliberate: the only info-level event h3 emits is the
+    // GOAWAY that precedes a server-initiated teardown, which is the one
+    // clue that explains a Cloudflare `H3_REQUEST_CANCELLED`.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("usque=info".parse()?))
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("usque=info".parse()?)
+                .add_directive("h3=info".parse()?),
+        )
         .init();
 
     let cli = Cli::parse();

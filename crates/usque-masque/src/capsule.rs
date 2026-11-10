@@ -71,6 +71,80 @@ pub fn decode_varint(input: &[u8]) -> Option<(u64, usize)> {
     Some((value, len))
 }
 
+/// Render a control capsule (RFC 9484 §4) for logging.
+///
+/// Only used on the control path, which carries a handful of capsules per
+/// session, so the allocation is irrelevant. Malformed bodies fall back to
+/// a hex dump rather than failing: a diagnostic must never be the reason a
+/// session dies.
+fn describe_control_capsule(capsule_type: u64, body: &[u8]) -> String {
+    match capsule_type {
+        CAPSULE_ADDRESS_ASSIGN => {
+            let mut out = String::from("ADDRESS_ASSIGN");
+            let mut rest = body;
+            while !rest.is_empty() {
+                let Some((request_id, n)) = decode_varint(rest) else {
+                    return format!("ADDRESS_ASSIGN (malformed: {body:02x?})");
+                };
+                rest = &rest[n..];
+                let Some((&version, tail)) = rest.split_first() else {
+                    return format!("ADDRESS_ASSIGN (malformed: {body:02x?})");
+                };
+                let addr_len = match version {
+                    4 => 4,
+                    6 => 16,
+                    _ => return format!("ADDRESS_ASSIGN (bad version {version})"),
+                };
+                if tail.len() < addr_len + 1 {
+                    return format!("ADDRESS_ASSIGN (malformed: {body:02x?})");
+                }
+                let addr = match version {
+                    4 => std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&tail[..4]).unwrap())
+                        .to_string(),
+                    _ => std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&tail[..16]).unwrap())
+                        .to_string(),
+                };
+                let prefix = tail[addr_len];
+                out.push_str(&format!(" [req={request_id} {addr}/{prefix}]"));
+                rest = &tail[addr_len + 1..];
+            }
+            out
+        }
+        CAPSULE_ROUTE_ADVERTISEMENT => {
+            let mut out = String::from("ROUTE_ADVERTISEMENT");
+            let mut rest = body;
+            while !rest.is_empty() {
+                let Some((&version, tail)) = rest.split_first() else {
+                    break;
+                };
+                let addr_len = match version {
+                    4 => 4,
+                    6 => 16,
+                    _ => return format!("ROUTE_ADVERTISEMENT (bad version {version})"),
+                };
+                if tail.len() < addr_len + 5 {
+                    return format!("ROUTE_ADVERTISEMENT (malformed: {body:02x?})");
+                }
+                let addr = match version {
+                    4 => std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&tail[..4]).unwrap())
+                        .to_string(),
+                    _ => std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&tail[..16]).unwrap())
+                        .to_string(),
+                };
+                let proto = tail[addr_len];
+                let start = u16::from_be_bytes([tail[addr_len + 1], tail[addr_len + 2]]);
+                let end = u16::from_be_bytes([tail[addr_len + 3], tail[addr_len + 4]]);
+                out.push_str(&format!(" [{addr} proto={proto} ports={start}-{end}]"));
+                rest = &tail[addr_len + 5..];
+            }
+            out
+        }
+        CAPSULE_ADDRESS_REQUEST => format!("ADDRESS_REQUEST ({} bytes)", body.len()),
+        CAPSULE_CONNECT_IP_REQUEST => format!("CONNECT_IP_REQUEST ({} bytes)", body.len()),
+        other => format!("type {other} ({} bytes)", body.len()),
+    }
+}
+
 /// Streaming reader for capsule-framed bodies. Stores pushed `Bytes`
 /// chunks and returns CONNECT-IP DATA payloads as refcounted slices
 /// that alias the underlying buffer. Already-consumed bytes are tracked
@@ -120,7 +194,18 @@ impl CapsuleReader {
                 CAPSULE_ADDRESS_ASSIGN
                 | CAPSULE_ADDRESS_REQUEST
                 | CAPSULE_ROUTE_ADVERTISEMENT
-                | CAPSULE_CONNECT_IP_REQUEST => continue,
+                | CAPSULE_CONNECT_IP_REQUEST => {
+                    // These carry the server's view of our lease. We do not
+                    // act on them (Cloudflare assigns the address up front
+                    // and never advertises routes), but logging them is the
+                    // only way to tell a mid-session lease change from a
+                    // plain teardown when the tunnel dies.
+                    tracing::debug!(
+                        "CONNECT-IP control capsule: {}",
+                        describe_control_capsule(capsule_type, &value)
+                    );
+                    continue;
+                }
                 _ => continue,
             }
         }
@@ -306,6 +391,26 @@ mod tests {
         let (value, len) = decode_varint(&buf).unwrap();
         assert_eq!(value, 300);
         assert_eq!(len, buf.len());
+    }
+
+    #[test]
+    fn describe_address_assign() {
+        // req=0, IPv4 172.16.0.2/32, then req=1, IPv6 2606:4700::1/128.
+        let mut body = vec![0x00, 4, 172, 16, 0, 2, 32];
+        body.extend_from_slice(&[0x01, 6]);
+        body.extend_from_slice(&[0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        body.push(128);
+
+        let text = describe_control_capsule(CAPSULE_ADDRESS_ASSIGN, &body);
+        assert!(text.contains("172.16.0.2/32"), "{text}");
+        assert!(text.contains("2606:4700::1/128"), "{text}");
+    }
+
+    #[test]
+    fn describe_malformed_capsule_does_not_panic() {
+        // Truncated IPv4 address: version says 4 bytes, only 2 follow.
+        let text = describe_control_capsule(CAPSULE_ADDRESS_ASSIGN, &[0x00, 4, 1, 2]);
+        assert!(text.contains("malformed"), "{text}");
     }
 
     #[test]

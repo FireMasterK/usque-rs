@@ -16,6 +16,21 @@ use usque_crypto::init as init_crypto;
 use crate::capsule::CapsuleReader;
 use crate::connect_ip::{ConnectIpSession, Transport};
 
+/// Upper bound on the idle heartbeat cadence.
+///
+/// The heartbeat must be *well* below the edge's session reaper, not
+/// merely equal to the transport keep-alive. Measured against
+/// Cloudflare's MASQUE edge: an idle session is still ACKed at 30s but
+/// is gone by 60s, while the QUIC idle timeout it advertises is ~56s.
+/// A 30s heartbeat therefore races the reaper and loses, and the tunnel
+/// dies on the QUIC idle timer. 10s leaves a comfortable margin; the
+/// probe is two bytes, so the cost is nil.
+const MAX_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn heartbeat_interval(keepalive: std::time::Duration) -> std::time::Duration {
+    keepalive.min(MAX_HEARTBEAT)
+}
+
 pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<ConnectIpSession> {
     init_crypto();
 
@@ -42,8 +57,12 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
         options.keepalive_period
     };
     transport.keep_alive_interval(Some(keepalive));
-    // Do not terminate the tunnel on inactivity. Idle tunnels are simply
-    // dormant; keep-alives preserve the session for subsequent activity.
+    // Opting out locally does NOT disable the idle timeout. RFC 9000 §10.1
+    // negotiates the *minimum* of both endpoints' `max_idle_timeout`, so
+    // Cloudflare's advertised value still applies (measured: 56s). This
+    // call only stops the client from imposing a shorter one of its own.
+    // The session is therefore kept alive by the heartbeat datagram in
+    // `connect_h3`, not by this setting — see `MAX_HEARTBEAT`.
     transport.max_idle_timeout(None);
     client_config.transport_config(Arc::new(transport));
     endpoint.set_default_client_config(client_config);
@@ -58,6 +77,26 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
     // h3-quinn's `DatagramSender` would `copy_to_bytes` the header and
     // payload into a fresh buffer (a full extra memcpy per packet).
     let conn_send = conn.clone();
+    // Kept by the session so `close()` can send a CONNECTION_CLOSE.
+    let conn_close = conn.clone();
+
+    // Watch the QUIC connection directly instead of relying on h3-quinn's
+    // error conversion: `ApplicationClose` there keeps only the error code,
+    // while the raw `quinn::ConnectionError` also carries the peer's reason
+    // string. Without this, every server-initiated teardown collapses into
+    // an indistinguishable "Tunnel connection lost: Closed" in the
+    // supervisor, so a Cloudflare "H3_REQUEST_CANCELLED" (0x10c) tells us
+    // nothing about *why* the request was cancelled.
+    let conn_watch = conn.clone();
+    tokio::spawn(async move {
+        let err = conn_watch.closed().await;
+        match err {
+            quinn::ConnectionError::LocallyClosed => {
+                debug!("MASQUE QUIC connection closed locally: {err}");
+            }
+            err => warn!("MASQUE QUIC connection closed: {err}"),
+        }
+    });
     let h3_conn = h3_quinn::Connection::new(conn);
     let (mut driver, mut send_request) = h3::client::builder()
         .enable_datagram(true)
@@ -118,8 +157,13 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
     let closed = Arc::new(AtomicBool::new(false));
 
     // Drive the HTTP/3 connection state machine on a background task.
+    // `poll_close` only resolves once the connection is finished, and its
+    // value is the terminal error (a GOAWAY alone does not resolve it).
+    // Log it: discarding it hides protocol-level failures that never
+    // surface as a datagram read error.
     tokio::spawn(async move {
-        let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
+        let err = future::poll_fn(|cx| driver.poll_close(cx)).await;
+        debug!("HTTP/3 connection driver finished: {err}");
     });
 
     // Drain the CONNECT response body (control-channel capsules this
@@ -130,17 +174,50 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
     let closed_recv = Arc::clone(&closed);
     let notify_recv = Arc::clone(&notify);
     tokio::spawn(async move {
-        let _send_request = send_request;
+        // Kept alive for the whole task: dropping the last `SendRequest`
+        // sends H3_NO_ERROR "Connection closed by client" and tears the
+        // connection down.
+        let send_request = send_request;
         let mut reader = CapsuleReader::new();
+        // A GOAWAY means the edge is draining and will not accept new
+        // requests on this connection. It is the usual precursor to the
+        // `H3_REQUEST_CANCELLED` that kills a long-lived tunnel, so treat
+        // it as a teardown and let the supervisor reconnect on a fresh
+        // connection instead of waiting to be cancelled.
+        let mut goaway_check = tokio::time::interval(std::time::Duration::from_secs(1));
+        goaway_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match request_stream.recv_data().await {
-                Ok(Some(mut data)) => {
-                    use bytes::Buf;
-                    let chunk: Bytes = data.copy_to_bytes(data.remaining());
-                    reader.push(chunk);
-                    while reader.next_ip_packet().is_some() {}
+            tokio::select! {
+                data = request_stream.recv_data() => match data {
+                    Ok(Some(mut data)) => {
+                        use bytes::Buf;
+                        let chunk: Bytes = data.copy_to_bytes(data.remaining());
+                        reader.push(chunk);
+                        while reader.next_ip_packet().is_some() {}
+                    }
+                    // The server ended the CONNECT-IP request stream but kept
+                    // the QUIC connection up. Surface the reason: a bare
+                    // "Closed" hides whether this was a graceful end
+                    // (H3_NO_ERROR) or the server cancelling the request
+                    // (H3_REQUEST_CANCELLED).
+                    Ok(None) => {
+                        debug!("CONNECT-IP request stream finished by the server");
+                        break;
+                    }
+                    Err(err) => {
+                        warn!("CONNECT-IP request stream terminated: {err}");
+                        break;
+                    }
+                },
+                _ = goaway_check.tick() => {
+                    if h3::ConnectionState::is_closing(&send_request) {
+                        warn!(
+                            "MASQUE server sent GOAWAY (draining); reconnecting before it \
+                             cancels the CONNECT-IP request"
+                        );
+                        break;
+                    }
                 }
-                Ok(None) | Err(_) => break,
             }
         }
         closed_recv.store(true, Ordering::Relaxed);
@@ -178,8 +255,9 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
     // Outgoing packets are sent as H3 DATAGRAMs bound to the CONNECT stream.
     // Periodically emit a tiny heartbeat datagram so the QUIC connection and
     // CONNECT-IP session stay alive across application-level idle gaps
-    // (transport keep-alive PINGs alone were insufficient).
-    let keepalive_tx = keepalive;
+    // (transport keep-alive PINGs alone were insufficient). The cadence is
+    // capped by `heartbeat_interval` so it never races the edge's reaper.
+    let keepalive_tx = heartbeat_interval(keepalive);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(keepalive_tx);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -235,6 +313,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
         Transport::H3Quinn {
             header: header_out,
             out: out_tx,
+            conn: Some(conn_close),
         },
         closed,
         1500,
@@ -243,6 +322,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
 
 #[cfg(test)]
 mod tests {
+    use super::{heartbeat_interval, MAX_HEARTBEAT};
     use bytes::Bytes;
     use h3_datagram::datagram::Datagram;
 
@@ -280,5 +360,20 @@ mod tests {
             unsafe { wire.as_ptr().add(2) },
             "decoded packet must alias the wire buffer"
         );
+    }
+
+    /// The idle heartbeat must stay well below the edge's session reaper
+    /// even when the user asks for a long transport keep-alive.
+    #[test]
+    fn heartbeat_is_capped_below_edge_reaper() {
+        use std::time::Duration;
+
+        assert_eq!(heartbeat_interval(Duration::from_secs(30)), MAX_HEARTBEAT);
+        assert_eq!(heartbeat_interval(Duration::from_secs(60)), MAX_HEARTBEAT);
+        assert_eq!(
+            heartbeat_interval(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert!(MAX_HEARTBEAT < Duration::from_secs(20));
     }
 }

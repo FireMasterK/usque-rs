@@ -46,6 +46,12 @@ pub(crate) enum Transport {
         /// Raw payload: context-id varint + IP packet (no quarter-stream-id
         /// prefix — the sender task builds the final contiguous `Bytes`).
         out: MAsyncTx<mpsc::Array<Vec<u8>>>,
+        /// Handle used to send a CONNECTION_CLOSE when the session is torn
+        /// down. Without it the server only learns the session is gone when
+        /// its own idle reaper fires, so a reconnect can briefly overlap a
+        /// session the edge still considers live. `None` in unit tests,
+        /// which have no live QUIC connection.
+        conn: Option<quinn::Connection>,
     },
     H2 {
         out: MAsyncTx<mpsc::Array<Bytes>>,
@@ -131,7 +137,23 @@ impl PacketSession for ConnectIpSession {
             if self.closed.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            self.notify.notified().await;
+            // Register interest *before* re-checking the state. The
+            // producers use `notify_waiters()`, which only wakes waiters
+            // that are already registered and stores no permit. Checking
+            // `closed` and then awaiting would lose a teardown that lands
+            // in between, leaving the pump parked forever on a dead
+            // session instead of returning `Ok(None)` so the supervisor
+            // can reconnect.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(packet) = self.incoming.lock().pop_front() {
+                return Ok(Some(packet));
+            }
+            if self.closed.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            notified.await;
         }
     }
 
@@ -156,7 +178,7 @@ impl PacketSession for ConnectIpSession {
                 out.send(payload).await.map_err(|_| SessionError::Closed)?;
             }
             #[cfg(feature = "quinn")]
-            Transport::H3Quinn { header, out } => {
+            Transport::H3Quinn { header, out, .. } => {
                 // Encode header + payload into one contiguous Vec so the
                 // sender task can wrap it as `Bytes` with a single move
                 // (no concat copy) and hand it to `quinn::Connection`.
@@ -185,6 +207,17 @@ impl PacketSession for ConnectIpSession {
     async fn close(&mut self) -> Result<(), SessionError> {
         self.closed.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
+        // Tear the QUIC connection down explicitly. Dropping the last
+        // handle would eventually do the same, but only after the
+        // supervisor's reconnect delay, and the peer would keep the
+        // CONNECT-IP session alive until its own idle reaper fired.
+        #[cfg(feature = "quinn")]
+        if let Transport::H3Quinn {
+            conn: Some(conn), ..
+        } = &self.transport
+        {
+            conn.close(0u32.into(), b"session closed");
+        }
         Ok(())
     }
 }
@@ -263,6 +296,73 @@ mod tests {
         assert_eq!(&got[..], &expected[..]);
     }
 
+    /// A teardown that lands while the reader is parked must wake it and
+    /// surface `Ok(None)`, so the supervisor reconnects instead of the
+    /// pump sitting on a dead session forever.
+    #[tokio::test]
+    async fn read_packet_wakes_on_teardown() {
+        let incoming: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let notify = Arc::new(Notify::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = mpsc::bounded_async::<Bytes>(8);
+        let mut session = ConnectIpSession::with_capacity(
+            Arc::clone(&incoming),
+            Arc::clone(&notify),
+            Transport::H2 { out: tx },
+            Arc::clone(&closed),
+            1500,
+        );
+
+        // Tear down only after the reader is already awaiting.
+        let closed_producer = Arc::clone(&closed);
+        let notify_producer = Arc::clone(&notify);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            closed_producer.store(true, Ordering::Relaxed);
+            notify_producer.notify_waiters();
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), session.read_packet())
+            .await
+            .expect("read_packet must not park on a torn-down session");
+
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got {result:?}"
+        );
+    }
+
+    /// A teardown that lands *before* the reader starts must also be
+    /// observed, not missed because no waiter was registered yet.
+    #[tokio::test]
+    async fn read_packet_observes_teardown_before_waiting() {
+        let incoming: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let notify = Arc::new(Notify::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = mpsc::bounded_async::<Bytes>(8);
+        let mut session = ConnectIpSession::with_capacity(
+            Arc::clone(&incoming),
+            Arc::clone(&notify),
+            Transport::H2 { out: tx },
+            Arc::clone(&closed),
+            1500,
+        );
+
+        // `notify_waiters()` stores no permit, so this only works because
+        // the reader re-checks the flag after registering interest.
+        closed.store(true, Ordering::Relaxed);
+        notify.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), session.read_packet())
+            .await
+            .expect("read_packet must not park on an already-closed session");
+
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got {result:?}"
+        );
+    }
+
     #[cfg(feature = "quinn")]
     #[tokio::test]
     async fn write_packet_h3_quinn_wire_layout() {
@@ -278,7 +378,11 @@ mod tests {
         let mut session = ConnectIpSession::with_capacity(
             Arc::new(Mutex::new(VecDeque::new())),
             Arc::new(Notify::new()),
-            Transport::H3Quinn { header, out: tx },
+            Transport::H3Quinn {
+                header,
+                out: tx,
+                conn: None,
+            },
             Arc::new(AtomicBool::new(false)),
             1500,
         );
