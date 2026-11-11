@@ -12,7 +12,8 @@ use http::Uri;
 use parking_lot::Mutex;
 use tokio_quiche::datagram_socket::DgramBuffer;
 use tokio_quiche::http3::driver::{
-    ClientH3Event, H3Event, InboundFrame, IncomingH3Headers, NewClientRequest, OutboundFrame,
+    ClientH3Event, H3Event, InboundFrame, InboundFrameStream, IncomingH3Headers, NewClientRequest,
+    OutboundFrame,
 };
 
 /// Headroom reserved in front of every outbound payload so the
@@ -161,49 +162,7 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
         match event {
             ClientH3Event::NewOutboundRequest { .. } => {}
             ClientH3Event::Core(H3Event::IncomingSettings { .. }) => {}
-            ClientH3Event::Core(H3Event::NewFlow {
-                flow_id: fid,
-                send,
-                mut recv,
-            }) if flow_send.is_none() => {
-                flow_id = Some(fid);
-                flow_send = Some(send);
-                let incoming_recv = Arc::clone(&incoming);
-                let notify_recv = Arc::clone(&notify);
-                let closed_recv = Arc::clone(&closed);
-                tokio::spawn(async move {
-                    loop {
-                        if closed_recv.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let Some(frame) = recv.recv().await else {
-                            break;
-                        };
-                        if let InboundFrame::Datagram(dgram) = frame {
-                            // dgram is an owned DgramBuffer (Vec<u8> wrapper).
-                            // `into_parts` moves the inner Vec out (no copy) and
-                            // reports the read cursor; `Bytes::from(vec)` wraps
-                            // it and `.slice(start..)` only bumps the refcount,
-                            // so the downstream pipeline stays zero-copy.
-                            let (vec, start) = dgram.into_parts();
-                            let bytes = Bytes::from(vec).slice(start..);
-                            if let Some(packet) =
-                                crate::datagram::decode_h3_datagram_payload_owned(&bytes)
-                            {
-                                incoming_recv.lock().push_back(packet);
-                                notify_recv.notify_waiters();
-                            }
-                        }
-                    }
-                    // The flow's datagram stream ended: mark the
-                    // session closed and wake the supervisor so
-                    // `read_packet` returns `Ok(None)` (reconnect)
-                    // instead of parking forever.
-                    closed_recv.store(true, Ordering::Relaxed);
-                    notify_recv.notify_waiters();
-                });
-            }
-            ClientH3Event::Core(H3Event::IncomingHeaders(headers)) => {
+            ClientH3Event::Core(H3Event::IncomingHeaders(mut headers)) => {
                 let status = response_status(&headers);
                 if status != 200 {
                     if status == 403 {
@@ -215,6 +174,20 @@ pub async fn connect_h3(options: &crate::session::ConnectOptions) -> Result<Conn
                 }
 
                 debug!("HTTP/3 CONNECT-IP established: {status}");
+
+                // The DATAGRAM flow channels are delivered inline with the
+                // response headers; there is no separate `NewFlow` event.
+                if let Some(flow) = headers.dgram_flow.take() {
+                    flow_id = Some(flow.flow_id);
+                    flow_send = Some(flow.send);
+                    spawn_datagram_reader(
+                        flow.recv,
+                        Arc::clone(&incoming),
+                        Arc::clone(&notify),
+                        Arc::clone(&closed),
+                    );
+                }
+
                 spawn_control_stream_reader(headers);
                 established = true;
             }
@@ -301,6 +274,43 @@ fn response_status(headers: &IncomingH3Headers) -> u16 {
         .and_then(|header| std::str::from_utf8(header.value()).ok())
         .and_then(|value| value.parse().ok())
         .unwrap_or(0)
+}
+
+/// Drain the CONNECT-IP datagram flow into the session's incoming queue.
+fn spawn_datagram_reader(
+    mut recv: InboundFrameStream,
+    incoming: Arc<Mutex<std::collections::VecDeque<Bytes>>>,
+    notify: Arc<tokio::sync::Notify>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            if closed.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(frame) = recv.recv().await else {
+                break;
+            };
+            if let InboundFrame::Datagram(dgram) = frame {
+                // dgram is an owned DgramBuffer (Vec<u8> wrapper).
+                // `into_parts` moves the inner Vec out (no copy) and
+                // reports the read cursor; `Bytes::from(vec)` wraps
+                // it and `.slice(start..)` only bumps the refcount,
+                // so the downstream pipeline stays zero-copy.
+                let (vec, start) = dgram.into_parts();
+                let bytes = Bytes::from(vec).slice(start..);
+                if let Some(packet) = crate::datagram::decode_h3_datagram_payload_owned(&bytes) {
+                    incoming.lock().push_back(packet);
+                    notify.notify_waiters();
+                }
+            }
+        }
+        // The flow's datagram stream ended: mark the session closed and
+        // wake the supervisor so `read_packet` returns `Ok(None)`
+        // (reconnect) instead of parking forever.
+        closed.store(true, Ordering::Relaxed);
+        notify.notify_waiters();
+    });
 }
 
 fn spawn_control_stream_reader(headers: IncomingH3Headers) {
