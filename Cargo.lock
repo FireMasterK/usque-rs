@@ -375,7 +375,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ade7181a62ceedcf367c29cbe8114fea9c3e770d8ce1d698dc568ab135295288"
 dependencies = [
  "backtrace",
- "rand 0.10.3",
+ "rand 0.10.4",
  "tokio",
  "trackable",
 ]
@@ -390,7 +390,7 @@ dependencies = [
  "hostname",
  "local-ip-address",
  "percent-encoding",
- "rand 0.10.3",
+ "rand 0.10.4",
  "thrift_codec",
  "tokio",
  "trackable",
@@ -1070,7 +1070,7 @@ dependencies = [
  "prometheus",
  "prometheus-client",
  "prometools",
- "rand 0.10.3",
+ "rand 0.10.4",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -2542,7 +2542,7 @@ dependencies = [
  "chacha20",
  "core_detect",
  "num-traits",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_xorshift",
  "regex-syntax",
  "unarray",
@@ -2679,7 +2679,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -2739,9 +2739,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -3556,7 +3556,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",
@@ -4051,7 +4051,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "hex",
- "rand 0.10.3",
+ "rand 0.10.4",
  "reqwest",
  "serde",
  "serde_json",
@@ -4205,7 +4205,7 @@ dependencies = [
  "futures",
  "libc",
  "parking_lot",
- "rand 0.10.3",
+ "rand 0.10.4",
  "serde_json",
  "smoltcp",
  "tokio",
